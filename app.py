@@ -60,18 +60,38 @@ INDICES = {
     "BANKEX":         {"security_id": "12",  "segment": "IDX_I", "lot_size": 15,  "strike_gap": 100},
 }
 
-DHAN_BASE  = "https://api.dhan.co/v2"
-CLIENT_ID  = "1100480354"   # Your Dhan Client ID
+DHAN_BASE = "https://api.dhan.co/v2"
+
+# Dhan intraday API: indices use NSE_EQ segment with INDEX instrument
+# Daily/historical API: indices use IDX_I segment
+INTRADAY_SEGMENT = "NSE_EQ"
+HISTORICAL_SEGMENT = "IDX_I"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DHAN API
 # ══════════════════════════════════════════════════════════════════════════════
 
+def extract_client_id(token: str) -> str:
+    """Extract dhanClientId directly from JWT payload — no hardcoding needed."""
+    import base64, json
+    try:
+        payload_part = token.split(".")[1]
+        # Add padding
+        padding = 4 - len(payload_part) % 4
+        payload_part += "=" * padding
+        decoded = base64.urlsafe_b64decode(payload_part)
+        data = json.loads(decoded)
+        return str(data.get("dhanClientId", ""))
+    except Exception:
+        return ""
+
+
 def dhan_headers(token: str) -> dict:
+    client_id = extract_client_id(token)
     return {
         "access-token": token,
-        "client-id": CLIENT_ID,
+        "client-id": client_id,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -81,25 +101,32 @@ def fetch_index_ohlcv(token: str, security_id: str,
                        from_date: str, to_date: str,
                        interval: str) -> pd.DataFrame | None:
     """
-    Fetch index historical OHLCV from Dhan.
-    Intraday intervals: 1,5,15,25,60 → /charts/intraday
-    Daily → /charts/historical with instrument=INDEX
+    Fetch index OHLCV from Dhan API.
+
+    Intraday (1/5/15/25/60 min):
+      POST /v2/charts/intraday
+      exchangeSegment = NSE_EQ, instrument = INDEX
+
+    Daily (D):
+      POST /v2/charts/historical
+      exchangeSegment = IDX_I, instrument = INDEX
     """
-    headers = dhan_headers(token)
+    headers      = dhan_headers(token)
     intraday_set = {"1", "5", "15", "25", "60"}
 
     if interval in intraday_set:
-        from_dt   = datetime.strptime(from_date, "%Y-%m-%d")
-        to_dt     = datetime.strptime(to_date,   "%Y-%m-%d")
+        from_dt    = datetime.strptime(from_date, "%Y-%m-%d")
+        to_dt      = datetime.strptime(to_date,   "%Y-%m-%d")
         total_days = max((to_dt - from_dt).days, 1)
         all_dfs, fetched = [], 0
         prog = st.progress(0, text="Fetching intraday data…")
-        cur = from_dt
+        cur  = from_dt
+
         while cur <= to_dt:
             end = min(cur + timedelta(days=90), to_dt)
             payload = {
                 "securityId":      security_id,
-                "exchangeSegment": "IDX_I",
+                "exchangeSegment": INTRADAY_SEGMENT,   # NSE_EQ for index intraday
                 "instrument":      "INDEX",
                 "interval":        interval,
                 "fromDate":        cur.strftime("%Y-%m-%d"),
@@ -108,18 +135,30 @@ def fetch_index_ohlcv(token: str, security_id: str,
             try:
                 r = requests.post(f"{DHAN_BASE}/charts/intraday",
                                   json=payload, headers=headers, timeout=30)
+                if r.status_code == 401:
+                    st.error("❌ 401 Unauthorized — Token expired or invalid. Please paste a fresh token.")
+                    return None
                 r.raise_for_status()
-                df = _parse(r.json())
+                data = r.json()
+                # Dhan wraps response in 'data' key sometimes
+                if isinstance(data, dict) and "data" in data:
+                    data = data["data"]
+                df = _parse(data)
                 if df is not None:
                     all_dfs.append(df)
-            except Exception as e:
-                st.error(f"API Error: {e}")
+            except requests.HTTPError as e:
+                st.error(f"API HTTP Error {e.response.status_code}: {e.response.text[:300]}")
                 return None
+            except Exception as e:
+                st.error(f"Request error: {e}")
+                return None
+
             fetched += (end - cur).days
             prog.progress(min(fetched / total_days, 1.0),
                           text=f"Fetching {cur.date()} → {end.date()}")
             cur = end + timedelta(days=1)
-            time.sleep(0.25)
+            time.sleep(0.3)
+
         prog.empty()
         if not all_dfs:
             return None
@@ -127,10 +166,12 @@ def fetch_index_ohlcv(token: str, security_id: str,
                   .drop_duplicates("timestamp")
                   .sort_values("timestamp")
                   .reset_index(drop=True))
+
     else:
+        # Daily historical
         payload = {
             "securityId":      security_id,
-            "exchangeSegment": "IDX_I",
+            "exchangeSegment": HISTORICAL_SEGMENT,    # IDX_I for daily
             "instrument":      "INDEX",
             "fromDate":        from_date,
             "toDate":          to_date,
@@ -139,11 +180,19 @@ def fetch_index_ohlcv(token: str, security_id: str,
         try:
             r = requests.post(f"{DHAN_BASE}/charts/historical",
                               json=payload, headers=headers, timeout=30)
+            if r.status_code == 401:
+                st.error("❌ 401 Unauthorized — Token expired or invalid. Please paste a fresh token.")
+                return None
             r.raise_for_status()
-            return _parse(r.json())
+            data = r.json()
+            if isinstance(data, dict) and "data" in data:
+                data = data["data"]
+            return _parse(data)
+        except requests.HTTPError as e:
+            st.error(f"API HTTP Error {e.response.status_code}: {e.response.text[:300]}")
         except Exception as e:
-            st.error(f"API Error: {e}")
-            return None
+            st.error(f"Request error: {e}")
+        return None
 
 
 def fetch_option_chain(token: str, security_id: str,
@@ -444,7 +493,11 @@ with st.sidebar:
         help="Get it from dhanhq.co → My Profile → API Access. Valid for 24h."
     )
     if access_token:
-        st.success("✅ Token received")
+        client_id_decoded = extract_client_id(access_token)
+        if client_id_decoded:
+            st.success(f"✅ Token OK · Client ID: `{client_id_decoded}`")
+        else:
+            st.warning("⚠️ Token received but Client ID not decoded")
     else:
         st.warning("⚠️ Token required to fetch data")
 
