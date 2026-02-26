@@ -57,7 +57,7 @@ from dataclasses import dataclass
 @dataclass
 class DhanConfig:
     client_id:    str = "1100480354"
-    access_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMTY3OTgxLCJhcHBfaWQiOiJjOTNkM2UwOSIsImlhdCI6MTc3MjA4MTU4MSwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.Kry8jyKMhIR-f1H5R0a2A4I9UHnWdDDE3LMmnXgOiE2U5pXWP3P0Scohw4j4IPvBPy3bPienE2vrWdU78bdJ0w"   # ← paste fresh token here daily
+    access_token: str = "paste_your_token_here"   # ← paste fresh token here daily
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
@@ -456,69 +456,154 @@ def generate_signals(df: pd.DataFrame, buy_lvl: float,
 def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                  comm_pct: float, lot_size: int,
                  trade_options: bool = False,
-                 fixed_lots: int = None) -> tuple[pd.DataFrame, list]:
+                 fixed_lots: int = None,
+                 spread_legs: list = None) -> tuple[pd.DataFrame, list]:
     """
-    Lot-based backtest — corrected sizing.
-    fixed_lots: if set, use exactly that many lots per trade (ignores size_pct).
-    Otherwise: lots = floor(capital * size_pct / (price * lot_size))
+    Spread-aware lot-based backtest.
+
+    Single leg:  price_col = opt_price (or close for index mode)
+    Multi-leg:   spread_price column = sum of signed leg prices already on df.
+                 Per-leg P&L breakdown recorded in each trade dict.
+
+    Sizing:
+      fixed_lots → that many SCALE lots (each leg uses its own leg["lots"] ratio)
+      % of Capital → lots = floor(budget / |spread_cost_per_lot|)
     """
-    cash, pos, entry_price, entry_time = capital, 0, 0.0, None
+    cash, pos_lots, entry_spread, entry_time = capital, 0, 0.0, None
     in_trade = False
     equities, trades = [], []
 
-    price_col = "opt_price" if (trade_options and "opt_price" in df.columns) else "close"
+    # Determine price column
+    if trade_options and spread_legs and "spread_price" in df.columns:
+        price_col = "spread_price"
+        is_spread  = True
+    elif trade_options and "opt_price" in df.columns:
+        price_col = "opt_price"
+        is_spread  = False
+    else:
+        price_col = "close"
+        is_spread  = False
 
-    for _, row in df.iterrows():
-        sig   = row["signal"]
-        price = row[price_col]
-        ts    = row["timestamp"]
+    # Build per-leg price lookups for spread mode
+    leg_price_series = {}
+    if is_spread and spread_legs:
+        ts_index = df["timestamp"].values
+        for i, ld in enumerate(spread_legs):
+            leg_price_series[i] = ld["prices"].reindex(
+                pd.Index(ts_index)
+            ).ffill().fillna(0).values
 
-        if pd.isna(price) or price <= 0:
-            equities.append(cash + pos * price if pos else cash)
+    df_ts = df["timestamp"].values  # fast numpy access
+
+    for row_i, row in df.iterrows():
+        sig = row["signal"]
+        ts  = row["timestamp"]
+        raw_price = row[price_col]
+
+        if pd.isna(raw_price):
+            equities.append(cash + pos_lots * (entry_spread if in_trade else 0))
             continue
 
+        # Spread price = net debit/credit per scale-lot
+        spread_price = float(raw_price)
+
+        # ── ENTRY ──────────────────────────────────────────────────────────
         if sig == 1 and not in_trade:
-            lot_cost = price * lot_size          # cost of ONE full lot
-            if lot_cost <= 0:
+            # Cost basis: |spread_price| × lot_size per scale-lot
+            cost_per_lot = abs(spread_price) * lot_size
+            if cost_per_lot < 0.01:
                 equities.append(cash)
                 continue
+
             if fixed_lots is not None:
-                lots = int(fixed_lots)
+                scale_lots = int(fixed_lots)
             else:
-                lots = max(int(cash * size_pct / lot_cost), 1)
-            qty  = lots * lot_size
-            cost = qty * price * (1 + comm_pct)
-            if cost <= cash:
-                pos, cash, entry_price, entry_time, in_trade = qty, cash - cost, price, ts, True
+                scale_lots = max(int(cash * size_pct / cost_per_lot), 1)
 
+            total_cost = cost_per_lot * scale_lots * (1 + comm_pct)
+            if total_cost <= cash:
+                pos_lots     = scale_lots
+                cash        -= total_cost
+                entry_spread = spread_price
+                entry_time   = ts
+                in_trade     = True
+
+        # ── EXIT ───────────────────────────────────────────────────────────
         elif sig == -1 and in_trade:
-            proceeds = pos * price * (1 - comm_pct)
-            pnl      = proceeds - pos * entry_price
-            cash    += proceeds
-            trades.append({
-                "entry_time":  entry_time, "exit_time":   ts,
-                "entry_price": round(entry_price, 2), "exit_price": round(price, 2),
-                "qty": pos, "lots": pos // lot_size,
-                "pnl": round(pnl, 2), "return_pct": round((price/entry_price - 1)*100, 3),
-                "exit_reason": "Signal", "strike": row.get("strike", "-"),
-            })
-            pos, in_trade = 0, False
+            exit_spread = spread_price
+            qty         = pos_lots * lot_size  # total underlying units
 
-        equities.append(cash + pos * price)
+            gross_pnl = (exit_spread - entry_spread) * qty
+            comm_cost = abs(exit_spread) * qty * comm_pct
+            pnl       = gross_pnl - comm_cost
+            cash     += abs(entry_spread) * qty + pnl  # return capital + P&L
 
-    if in_trade and pos > 0:
-        lp = df[price_col].iloc[-1]
-        proceeds = pos * lp * (1 - comm_pct)
-        pnl = proceeds - pos * entry_price
-        cash += proceeds
-        trades.append({
-            "entry_time": entry_time, "exit_time": df["timestamp"].iloc[-1],
-            "entry_price": round(entry_price, 2), "exit_price": round(lp, 2),
-            "qty": pos, "lots": pos // lot_size,
-            "pnl": round(pnl, 2), "return_pct": round((lp/entry_price - 1)*100, 3),
+            trade_rec = {
+                "entry_time":    entry_time,
+                "exit_time":     ts,
+                "entry_price":   round(entry_spread, 2),
+                "exit_price":    round(exit_spread,  2),
+                "qty":           qty,
+                "lots":          pos_lots,
+                "pnl":           round(pnl, 2),
+                "return_pct":    round((exit_spread / entry_spread - 1) * 100, 2)
+                                 if entry_spread != 0 else 0.0,
+                "exit_reason":   "Signal",
+                "strike":        row.get("strike", "-"),
+            }
+
+            # Per-leg P&L breakdown for spread trades
+            if is_spread and spread_legs:
+                for i, ld in enumerate(spread_legs):
+                    lp_arr  = leg_price_series.get(i)
+                    if lp_arr is not None and row_i < len(lp_arr):
+                        # Find entry row index (approx by timestamp match)
+                        try:
+                            entry_idx = list(df_ts).index(entry_time)
+                            ep = float(lp_arr[entry_idx])
+                            xp = float(lp_arr[row_i])
+                        except (ValueError, IndexError):
+                            ep = xp = 0.0
+                        sign      = 1 if ld["direction"] == "BUY" else -1
+                        leg_pnl   = sign * (xp - ep) * ld["lots"] * lot_size
+                        trade_rec[f"leg{i+1}_{ld['strike_lbl']}_{ld['opt_type']}"] = round(leg_pnl, 2)
+
+            trades.append(trade_rec)
+            pos_lots, in_trade = 0, False
+
+        # Mark-to-market equity
+        mtm = spread_price * pos_lots * lot_size if in_trade else 0
+        equities.append(cash + mtm)
+
+    # Force-close open position at last bar
+    if in_trade and pos_lots > 0:
+        lp = float(df[price_col].iloc[-1])
+        qty = pos_lots * lot_size
+        pnl = (lp - entry_spread) * qty - abs(lp) * qty * comm_pct
+        cash += abs(entry_spread) * qty + pnl
+        trade_rec = {
+            "entry_time":  entry_time, "exit_time": df["timestamp"].iloc[-1],
+            "entry_price": round(entry_spread, 2), "exit_price": round(lp, 2),
+            "qty": qty, "lots": pos_lots,
+            "pnl": round(pnl, 2),
+            "return_pct": round((lp / entry_spread - 1) * 100, 2) if entry_spread != 0 else 0.0,
             "exit_reason": "End of Data",
             "strike": df["strike"].iloc[-1] if "strike" in df.columns else "-",
-        })
+        }
+        if is_spread and spread_legs:
+            for i, ld in enumerate(spread_legs):
+                lp_arr = leg_price_series.get(i)
+                if lp_arr is not None:
+                    try:
+                        entry_idx = list(df_ts).index(entry_time)
+                        ep = float(lp_arr[entry_idx])
+                        xp = float(lp_arr[-1])
+                    except (ValueError, IndexError):
+                        ep = xp = 0.0
+                    sign    = 1 if ld["direction"] == "BUY" else -1
+                    leg_pnl = sign * (xp - ep) * ld["lots"] * lot_size
+                    trade_rec[f"leg{i+1}_{ld['strike_lbl']}_{ld['opt_type']}"] = round(leg_pnl, 2)
+        trades.append(trade_rec)
         if equities:
             equities[-1] = cash
 
@@ -632,29 +717,81 @@ with st.sidebar:
     trade_options = backtest_mode == "Options (Real Data)"
 
     if trade_options:
-        st.markdown('<div class="sidebar-header">📌 Strike Selection</div>', unsafe_allow_html=True)
-
-        opt_type = st.radio("Option Type", ["CE (Call)", "PE (Put)"], horizontal=True)
-        opt_type = "CALL" if "CE" in opt_type else "PUT"
-
-        # Strike offset selector: ATM-3 … ATM … ATM+3
-        offsets       = list(range(-3, 4))
-        offset_labels = [get_strike_label(o) for o in offsets]
-        sel_label     = st.select_slider(
-            "Strike",
-            options=offset_labels,
-            value="ATM",
-            help="ATM = At the Money. +1 = one strike away (OTM for CE). Max ±10 near expiry."
-        )
-        strike_offset = offsets[offset_labels.index(sel_label)]
+        st.markdown('<div class="sidebar-header">📌 Option Legs (Spread / Hedge)</div>', unsafe_allow_html=True)
 
         expiry_flag = st.radio("Expiry Type", ["WEEK", "MONTH"], horizontal=True,
                                help="Weekly or Monthly expiry contract")
 
-        st.info(
-            f"Fetching **{get_strike_label(strike_offset)} {opt_type}** real option data\n"
-            f"via Dhan `/charts/rollingoption`"
+        n_legs = st.selectbox("Number of Legs", [1, 2, 3, 4], index=0,
+                              help="1 = Single option | 2 = Spread | 3-4 = Complex (Iron Condor etc.)")
+
+        # Preset templates
+        PRESETS = {
+            "Custom": None,
+            "Bull Call Spread":  [("CALL","ATM",0,"BUY"),  ("CALL","ATM+1",1,"SELL")],
+            "Bear Put Spread":   [("PUT", "ATM",0,"BUY"),  ("PUT", "ATM-1",-1,"SELL")],
+            "Bull Put Spread":   [("PUT", "ATM-1",-1,"SELL"),("PUT","ATM-2",-2,"BUY")],
+            "Bear Call Spread":  [("CALL","ATM+1",1,"SELL"),("CALL","ATM+2",2,"BUY")],
+            "Long Strangle":     [("CALL","ATM+1",1,"BUY"), ("PUT","ATM-1",-1,"BUY")],
+            "Short Strangle":    [("CALL","ATM+1",1,"SELL"),("PUT","ATM-1",-1,"SELL")],
+            "Long Straddle":     [("CALL","ATM",0,"BUY"),  ("PUT","ATM",0,"BUY")],
+            "Iron Condor":       [("PUT","ATM-2",-2,"BUY"),("PUT","ATM-1",-1,"SELL"),
+                                  ("CALL","ATM+1",1,"SELL"),("CALL","ATM+2",2,"BUY")],
+        }
+
+        preset = st.selectbox("📋 Strategy Template", list(PRESETS.keys()), index=0)
+
+        offsets_list  = list(range(-10, 11))
+        offset_labels = [get_strike_label(o) for o in offsets_list]
+
+        option_legs = []
+        for i in range(n_legs):
+            with st.expander(f"Leg {i+1}", expanded=True):
+                # Auto-fill from preset
+                if preset != "Custom" and PRESETS[preset] and i < len(PRESETS[preset]):
+                    p_type, p_label, p_off, p_dir = PRESETS[preset][i]
+                    def_type = 0 if p_type == "CALL" else 1
+                    def_off  = p_label
+                    def_dir  = 0 if p_dir == "BUY" else 1
+                else:
+                    def_type = 0; def_off = "ATM"; def_dir = 0
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    leg_type = st.radio(f"Type##leg{i}", ["CE (Call)", "PE (Put)"],
+                                        index=def_type, horizontal=True, key=f"leg_type_{i}")
+                with c2:
+                    leg_dir  = st.radio(f"Direction##leg{i}", ["BUY", "SELL"],
+                                        index=def_dir, horizontal=True, key=f"leg_dir_{i}")
+
+                leg_strike_lbl = st.select_slider(
+                    f"Strike##leg{i}",
+                    options=offset_labels,
+                    value=def_off if def_off in offset_labels else "ATM",
+                    key=f"leg_strike_{i}"
+                )
+                leg_offset = offsets_list[offset_labels.index(leg_strike_lbl)]
+                leg_lots   = st.number_input(f"Lots##leg{i}", min_value=1, max_value=50,
+                                              value=1, key=f"leg_lots_{i}")
+
+                option_legs.append({
+                    "opt_type":    "CALL" if "CE" in leg_type else "PUT",
+                    "direction":   leg_dir,          # "BUY" or "SELL"
+                    "offset":      leg_offset,
+                    "strike_lbl":  leg_strike_lbl,
+                    "lots":        int(leg_lots),
+                })
+
+        # Backward compat single-leg variables
+        opt_type      = option_legs[0]["opt_type"]
+        strike_offset = option_legs[0]["offset"]
+
+        # Strategy summary
+        leg_summaries = " | ".join(
+            f"{lg['direction']} {lg['lots']}L {lg['strike_lbl']} {lg['opt_type']}"
+            for lg in option_legs
         )
+        st.info(f"**Strategy:** {leg_summaries}")
 
     # ── Strategy Parameters ──────────────────────────────────────────────────
     st.markdown('<div class="sidebar-header">⚙️ Strategy Parameters</div>', unsafe_allow_html=True)
@@ -738,51 +875,81 @@ if run_btn:
         fvgs = fair_value_gaps(df)
         df   = generate_signals(df, bsp_buy_lvl, bsp_sell_lvl)
 
-    # ── 3. Fetch Real Option Data (if options mode) ───────────────────────────
-    opt_df = None
+    # ── 3. Fetch Option Legs ─────────────────────────────────────────────────
+    leg_dfs = []   # one price-series df per leg, aligned to main df index
     if trade_options:
-        with st.spinner(f"📡 Fetching {get_strike_label(strike_offset)} {opt_type} option data…"):
-            opt_df = _fetcher.fetch_rolling_option(
-                idx_cfg["security_id"],
-                strike_offset, opt_type,
-                from_date.strftime("%Y-%m-%d"),
-                to_date.strftime("%Y-%m-%d"),
-                interval=interval if interval != "D" else "25",
-                expiry_flag=expiry_flag,
-                debug=debug_mode
-            )
+        fetch_interval = interval if interval != "D" else "25"
+        fd = from_date.strftime("%Y-%m-%d")
+        td = to_date.strftime("%Y-%m-%d")
 
-        if opt_df is not None and not opt_df.empty:
-            st.success(f"✅ Option data: **{len(opt_df):,} bars** · {get_strike_label(strike_offset)} {opt_type}")
-            # Merge option close price into df on nearest timestamp
-            opt_df_r = opt_df[["timestamp","close","oi"]].rename(
-                columns={"close":"opt_price","oi":"opt_oi"}
-            )
-            df = pd.merge_asof(
-                df.sort_values("timestamp"),
-                opt_df_r.sort_values("timestamp"),
-                on="timestamp", direction="nearest", tolerance=pd.Timedelta("30min")
-            )
-        else:
-            st.warning("⚠️ Option data unavailable. Falling back to Black-Scholes simulation.")
-            df = simulate_option_prices(df, strike_offset, strike_gap,
-                                         opt_type, 7, 0.15)
+        for i, leg in enumerate(option_legs):
+            lbl = f"Leg {i+1}: {leg['direction']} {leg['lots']}L {leg['strike_lbl']} {leg['opt_type']}"
+            with st.spinner(f"📡 Fetching {lbl}…"):
+                raw = _fetcher.fetch_rolling_option(
+                    idx_cfg["security_id"],
+                    leg["offset"], leg["opt_type"],
+                    fd, td,
+                    interval=fetch_interval,
+                    expiry_flag=expiry_flag,
+                    debug=debug_mode
+                )
+
+            if raw is not None and not raw.empty:
+                st.success(f"✅ {lbl} — {len(raw):,} bars")
+                # Merge onto main df timestamps
+                leg_price = raw[["timestamp","close"]].rename(
+                    columns={"close": f"leg{i}_price"}
+                )
+                merged = pd.merge_asof(
+                    df[["timestamp"]].sort_values("timestamp"),
+                    leg_price.sort_values("timestamp"),
+                    on="timestamp", direction="nearest",
+                    tolerance=pd.Timedelta("30min")
+                )
+                leg_dfs.append({**leg, "prices": merged.set_index("timestamp")[f"leg{i}_price"]})
+            else:
+                st.warning(f"⚠️ {lbl} — no data, falling back to Black-Scholes simulation.")
+                # BS fallback for this leg
+                sim = simulate_option_prices(
+                    df, leg["offset"], strike_gap, leg["opt_type"], 7, 0.15
+                )
+                leg_dfs.append({**leg, "prices": sim.set_index("timestamp")["opt_price"]})
+
+        # Build combined spread price column on df:
+        # net_price = sum(signed_price per leg)
+        # BUY leg  → pay premium  → negative cash at entry, positive at exit
+        # SELL leg → receive prem → positive cash at entry, negative at exit
+        df = df.set_index("timestamp")
+        df["spread_price"] = 0.0
+        for ld in leg_dfs:
+            sign = 1 if ld["direction"] == "BUY" else -1
+            p    = ld["prices"].reindex(df.index).ffill().fillna(0)
+            df["spread_price"] += sign * p * ld["lots"]
+        df = df.reset_index()
+
+        # Legacy single-leg compat (used by chart subplot)
+        if leg_dfs:
+            df["opt_price"] = leg_dfs[0]["prices"].reindex(
+                df.set_index("timestamp").index
+            ).ffill().fillna(0).values
 
     # ── 4. Run Backtest ───────────────────────────────────────────────────────
     with st.spinner("📊 Running backtest…"):
         results, trades = run_backtest(
             df, init_capital, pos_size_pct / 100,
             comm_pct / 100, lot_size, trade_options,
-            fixed_lots=fixed_lots
+            fixed_lots=fixed_lots,
+            spread_legs=leg_dfs if trade_options else None
         )
         m = metrics(results, trades, init_capital)
 
     # ── 5. Mode Banner ────────────────────────────────────────────────────────
     if trade_options:
-        st.info(
-            f"📌 **Options Mode (Real Data)** | {index_name} | "
-            f"**{get_strike_label(strike_offset)} {opt_type}** | {expiry_flag} expiry"
+        leg_summaries = " | ".join(
+            f"{lg['direction']} {lg['lots']}L {lg['strike_lbl']} {lg['opt_type']}"
+            for lg in option_legs
         )
+        st.info(f"📌 **Options Mode** | {index_name} | {leg_summaries} | {expiry_flag}")
     else:
         st.info(f"📈 **Index Mode** | {index_name} | Lot Size: {lot_size}")
 
@@ -918,56 +1085,80 @@ if run_btn:
         if trades:
             tdf = pd.DataFrame(trades)
 
-            # Round all numeric columns to 2 decimal places
+            # Round core numeric columns to 2dp
             for col in ["entry_price","exit_price","pnl","return_pct"]:
                 if col in tdf.columns:
                     tdf[col] = tdf[col].round(2)
 
-            # Add cumulative P&L column
+            # Cumulative P&L
             tdf["cum_pnl"] = tdf["pnl"].cumsum().round(2)
 
-            cols = ["entry_time","exit_time","entry_price","exit_price",
-                    "qty","lots","strike","pnl","cum_pnl","return_pct","exit_reason"]
-            cols = [c for c in cols if c in tdf.columns]
+            # Detect leg breakdown columns (leg1_ATM_CALL etc.)
+            leg_cols = [c for c in tdf.columns if c.startswith("leg") and "_" in c[3:]]
+
+            # Core columns always shown
+            base_cols = ["entry_time","exit_time","entry_price","exit_price",
+                         "qty","lots","pnl","cum_pnl","return_pct","exit_reason"]
+            # Insert leg breakdown after exit_price if present
+            all_cols = ["entry_time","exit_time","entry_price","exit_price",
+                        "qty","lots"] + leg_cols + ["pnl","cum_pnl","return_pct","exit_reason"]
+            all_cols = [c for c in all_cols if c in tdf.columns]
 
             rename_map = {
-                "entry_time":  "Entry",
-                "exit_time":   "Exit",
-                "entry_price": "Entry ₹",
-                "exit_price":  "Exit ₹",
-                "qty":         "Qty",
-                "lots":        "Lots",
-                "strike":      "Strike",
-                "pnl":         "P&L ₹",
-                "cum_pnl":     "Cum. P&L ₹",
-                "return_pct":  "Return %",
-                "exit_reason": "Reason",
+                "entry_time":  "Entry",   "exit_time":   "Exit",
+                "entry_price": "Net Entry ₹" if len(leg_cols) > 0 else "Entry ₹",
+                "exit_price":  "Net Exit ₹"  if len(leg_cols) > 0 else "Exit ₹",
+                "qty":         "Qty",     "lots":        "Scale Lots" if len(leg_cols) > 0 else "Lots",
+                "pnl":         "Net P&L ₹",  "cum_pnl":     "Cum. P&L ₹",
+                "return_pct":  "Return %",   "exit_reason": "Reason",
             }
+            # Pretty-name leg columns: leg1_ATM+1_CALL → "L1 ATM+1 CE ₹"
+            for lc in leg_cols:
+                parts = lc.split("_", 1)
+                leg_num = parts[0].replace("leg", "L")
+                rest    = parts[1].replace("_CALL", " CE").replace("_PUT", " PE")
+                rename_map[lc] = f"{leg_num} {rest} ₹"
 
-            display = tdf[cols].rename(columns=rename_map)
+            display = tdf[all_cols].rename(columns=rename_map)
 
-            # Format numeric columns explicitly to 2dp
-            fmt_cols = ["Entry ₹","Exit ₹","P&L ₹","Cum. P&L ₹","Return %"]
-            fmt_cols = [c for c in fmt_cols if c in display.columns]
+            # All float columns → 2dp format
+            float_cols = display.select_dtypes(include="number").columns.tolist()
+            fmt_dict   = {c: "{:.2f}" for c in float_cols}
 
-            styled = display.style.format(
-                {c: "{:.2f}" for c in fmt_cols}
-            ).applymap(
-                lambda v: "color:#00d4aa" if isinstance(v,(int,float)) and v > 0
-                          else ("color:#ff4b6e" if isinstance(v,(int,float)) and v < 0 else ""),
-                subset=["P&L ₹","Cum. P&L ₹","Return %"]
+            # Color: green for positive, red for negative
+            color_cols = [rename_map.get("pnl","Net P&L ₹"),
+                          rename_map.get("cum_pnl","Cum. P&L ₹"),
+                          rename_map.get("return_pct","Return %")]
+            color_cols += [rename_map[lc] for lc in leg_cols if lc in rename_map]
+            color_cols  = [c for c in color_cols if c in display.columns]
+
+            styled = display.style.format(fmt_dict).applymap(
+                lambda v: ("color:#00d4aa" if isinstance(v,(int,float)) and v > 0
+                           else "color:#ff4b6e" if isinstance(v,(int,float)) and v < 0
+                           else ""),
+                subset=color_cols
             )
 
             st.dataframe(styled, use_container_width=True, height=500)
 
-            # Summary row below table
+            # Summary bar
             total_pnl = tdf["pnl"].sum()
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total P&L", f"₹{total_pnl:,.2f}",
+            c1.metric("Net P&L", f"₹{total_pnl:,.2f}",
                       delta=f"{'▲' if total_pnl>0 else '▼'} {total_pnl/init_capital*100:.2f}%")
-            c2.metric("Trades",    len(tdf))
+            c2.metric("Trades",        len(tdf))
             c3.metric("Avg P&L/Trade", f"₹{tdf['pnl'].mean():,.2f}")
             c4.metric("Best Trade",    f"₹{tdf['pnl'].max():,.2f}")
+
+            # Leg-level P&L summary for spreads
+            if leg_cols:
+                st.markdown("##### 📊 Leg-wise P&L Summary")
+                leg_summary_cols = st.columns(len(leg_cols))
+                for j, lc in enumerate(leg_cols):
+                    nice = rename_map.get(lc, lc)
+                    total = tdf[lc].sum()
+                    leg_summary_cols[j].metric(nice, f"₹{total:,.2f}",
+                        delta=f"{'▲' if total>0 else '▼'}")
 
             csv = tdf.to_csv(index=False)
             st.download_button("⬇️ Download CSV", csv,
