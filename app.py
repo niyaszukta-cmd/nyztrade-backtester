@@ -63,10 +63,10 @@ INDICES = {
 DHAN_BASE = "https://api.dhan.co/v2"
 
 # ── Dhan segment/instrument combos for indices ────────────────────────────────
-# Intraday  (/charts/intraday):   NSE_FNO  + INDEX
-# Daily     (/charts/historical): IDX_I    + INDEX
-# Rolling option (/charts/rollingoption): NSE_FNO + OPTIDX  ← for options backtest
-INTRADAY_SEGMENT   = "NSE_FNO"
+# Intraday  (/charts/intraday):   IDX_I  + INDEX  (fromDate must include time HH:MM:SS)
+# Daily     (/charts/historical): IDX_I  + INDEX  (fromDate is date only YYYY-MM-DD)
+# Rolling option (/charts/rollingoption): NSE_FNO + OPTIDX
+# NOTE: client-id header must NOT be sent for chart endpoints — causes DH-901 401 error
 HISTORICAL_SEGMENT = "IDX_I"
 
 
@@ -85,13 +85,20 @@ def extract_client_id(token: str) -> str:
         return ""
 
 
-def dhan_headers(token: str) -> dict:
-    return {
+def dhan_headers(token: str, include_client_id: bool = False) -> dict:
+    """
+    Dhan API headers.
+    Charts/historical endpoints: only access-token needed (client-id causes 401)
+    Option chain endpoints: need both access-token AND client-id
+    """
+    h = {
         "access-token": token,
-        "client-id":    extract_client_id(token),
         "Content-Type": "application/json",
         "Accept":       "application/json",
     }
+    if include_client_id:
+        h["client-id"] = extract_client_id(token)
+    return h
 
 
 def _show_api_error(r: requests.Response) -> None:
@@ -135,20 +142,21 @@ def fetch_index_ohlcv(token: str, security_id: str,
 
         while cur <= to_dt:
             end = min(cur + timedelta(days=90), to_dt)
+            # Dhan intraday requires datetime format with time component
             payload = {
                 "securityId":      str(security_id),
-                "exchangeSegment": INTRADAY_SEGMENT,
+                "exchangeSegment": "IDX_I",
                 "instrument":      "INDEX",
                 "interval":        interval,
-                "fromDate":        cur.strftime("%Y-%m-%d"),
-                "toDate":          end.strftime("%Y-%m-%d"),
+                "fromDate":        cur.strftime("%Y-%m-%d") + " 09:15:00",
+                "toDate":          end.strftime("%Y-%m-%d") + " 15:30:00",
             }
             if debug:
                 st.write("📤 **Intraday payload:**", payload)
 
             try:
                 r = requests.post(f"{DHAN_BASE}/charts/intraday",
-                                  json=payload, headers=headers, timeout=30)
+                                  json=payload, headers=dhan_headers(token), timeout=30)
                 if debug:
                     st.write(f"📥 **Response {r.status_code}:**", r.text[:600])
 
@@ -196,7 +204,7 @@ def fetch_index_ohlcv(token: str, security_id: str,
 
         try:
             r = requests.post(f"{DHAN_BASE}/charts/historical",
-                              json=payload, headers=headers, timeout=30)
+                              json=payload, headers=dhan_headers(token), timeout=30)
             if debug:
                 st.write(f"📥 **Response {r.status_code}:**", r.text[:600])
 
