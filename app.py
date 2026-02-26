@@ -455,12 +455,12 @@ def generate_signals(df: pd.DataFrame, buy_lvl: float,
 
 def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                  comm_pct: float, lot_size: int,
-                 trade_options: bool = False) -> tuple[pd.DataFrame, list]:
+                 trade_options: bool = False,
+                 fixed_lots: int = None) -> tuple[pd.DataFrame, list]:
     """
     Lot-based backtest — corrected sizing.
-    lots = floor(budget / (price_per_lot))
-    qty  = lots * lot_size
-    Prevents the old ×lot_size double-count bug.
+    fixed_lots: if set, use exactly that many lots per trade (ignores size_pct).
+    Otherwise: lots = floor(capital * size_pct / (price * lot_size))
     """
     cash, pos, entry_price, entry_time = capital, 0, 0.0, None
     in_trade = False
@@ -482,7 +482,10 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
             if lot_cost <= 0:
                 equities.append(cash)
                 continue
-            lots = max(int(cash * size_pct / lot_cost), 1)
+            if fixed_lots is not None:
+                lots = int(fixed_lots)
+            else:
+                lots = max(int(cash * size_pct / lot_cost), 1)
             qty  = lots * lot_size
             cost = qty * price * (1 + comm_pct)
             if cost <= cash:
@@ -672,10 +675,16 @@ with st.sidebar:
         show_e100 = st.checkbox("EMA 100", True)
         show_e200 = st.checkbox("EMA 200", True)
 
-    st.markdown('<div class="sidebar-header">💼 Capital</div>', unsafe_allow_html=True)
-    init_capital = st.number_input("Initial Capital (₹)", value=500000, step=50000)
-    pos_size_pct = st.slider("Position Size (%)", 5, 100, 50)
-    comm_pct     = st.number_input("Commission (%)", value=0.03, step=0.01, format="%.3f")
+    st.markdown('<div class="sidebar-header">💼 Capital & Sizing</div>', unsafe_allow_html=True)
+    init_capital  = st.number_input("Initial Capital (₹)", value=500000, step=50000)
+    sizing_mode   = st.radio("Position Sizing", ["% of Capital", "Fixed Lots"], horizontal=True)
+    if sizing_mode == "% of Capital":
+        pos_size_pct = st.slider("Position Size (%)", 5, 100, 50)
+        fixed_lots   = None
+    else:
+        fixed_lots   = st.number_input("Fixed Lots per Trade", min_value=1, max_value=100, value=1, step=1)
+        pos_size_pct = 100   # unused in fixed mode, placeholder
+    comm_pct = st.number_input("Commission (%)", value=0.03, step=0.01, format="%.3f")
 
     st.markdown('<div class="sidebar-header">🛠️ Debug</div>', unsafe_allow_html=True)
     debug_mode = st.checkbox("Show API request/response", False,
@@ -763,7 +772,8 @@ if run_btn:
     with st.spinner("📊 Running backtest…"):
         results, trades = run_backtest(
             df, init_capital, pos_size_pct / 100,
-            comm_pct / 100, lot_size, trade_options
+            comm_pct / 100, lot_size, trade_options,
+            fixed_lots=fixed_lots
         )
         m = metrics(results, trades, init_capital)
 
@@ -906,26 +916,60 @@ if run_btn:
     with tab2:
         st.markdown("#### Trade Log")
         if trades:
-            tdf     = pd.DataFrame(trades)
-            cols    = ["entry_time","exit_time","entry_price","exit_price",
-                       "qty","lots","strike","pnl","return_pct","exit_reason"]
-            cols    = [c for c in cols if c in tdf.columns]
-            styled  = (
-                tdf[cols]
-                .rename(columns={
-                    "entry_time":"Entry", "exit_time":"Exit",
-                    "entry_price":"Entry ₹","exit_price":"Exit ₹",
-                    "qty":"Qty","lots":"Lots","strike":"Strike",
-                    "pnl":"P&L ₹","return_pct":"Return %","exit_reason":"Reason"
-                })
-                .style.applymap(
-                    lambda v: "color:#00d4aa" if isinstance(v, (int,float)) and v > 0
-                              else ("color:#ff4b6e" if isinstance(v, (int,float)) and v < 0 else ""),
-                    subset=["P&L ₹","Return %"]
-                )
+            tdf = pd.DataFrame(trades)
+
+            # Round all numeric columns to 2 decimal places
+            for col in ["entry_price","exit_price","pnl","return_pct"]:
+                if col in tdf.columns:
+                    tdf[col] = tdf[col].round(2)
+
+            # Add cumulative P&L column
+            tdf["cum_pnl"] = tdf["pnl"].cumsum().round(2)
+
+            cols = ["entry_time","exit_time","entry_price","exit_price",
+                    "qty","lots","strike","pnl","cum_pnl","return_pct","exit_reason"]
+            cols = [c for c in cols if c in tdf.columns]
+
+            rename_map = {
+                "entry_time":  "Entry",
+                "exit_time":   "Exit",
+                "entry_price": "Entry ₹",
+                "exit_price":  "Exit ₹",
+                "qty":         "Qty",
+                "lots":        "Lots",
+                "strike":      "Strike",
+                "pnl":         "P&L ₹",
+                "cum_pnl":     "Cum. P&L ₹",
+                "return_pct":  "Return %",
+                "exit_reason": "Reason",
+            }
+
+            display = tdf[cols].rename(columns=rename_map)
+
+            # Format numeric columns explicitly to 2dp
+            fmt_cols = ["Entry ₹","Exit ₹","P&L ₹","Cum. P&L ₹","Return %"]
+            fmt_cols = [c for c in fmt_cols if c in display.columns]
+
+            styled = display.style.format(
+                {c: "{:.2f}" for c in fmt_cols}
+            ).applymap(
+                lambda v: "color:#00d4aa" if isinstance(v,(int,float)) and v > 0
+                          else ("color:#ff4b6e" if isinstance(v,(int,float)) and v < 0 else ""),
+                subset=["P&L ₹","Cum. P&L ₹","Return %"]
             )
+
             st.dataframe(styled, use_container_width=True, height=500)
-            csv = pd.DataFrame(trades).to_csv(index=False)
+
+            # Summary row below table
+            total_pnl = tdf["pnl"].sum()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total P&L", f"₹{total_pnl:,.2f}",
+                      delta=f"{'▲' if total_pnl>0 else '▼'} {total_pnl/init_capital*100:.2f}%")
+            c2.metric("Trades",    len(tdf))
+            c3.metric("Avg P&L/Trade", f"₹{tdf['pnl'].mean():,.2f}")
+            c4.metric("Best Trade",    f"₹{tdf['pnl'].max():,.2f}")
+
+            csv = tdf.to_csv(index=False)
             st.download_button("⬇️ Download CSV", csv,
                                f"{index_name}_trades.csv", "text/csv")
         else:
