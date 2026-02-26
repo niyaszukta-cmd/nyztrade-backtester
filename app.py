@@ -57,7 +57,7 @@ from dataclasses import dataclass
 @dataclass
 class DhanConfig:
     client_id:    str = "1100480354"
-    access_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMTY3OTgxLCJhcHBfaWQiOiJjOTNkM2UwOSIsImlhdCI6MTc3MjA4MTU4MSwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.Kry8jyKMhIR-f1H5R0a2A4I9UHnWdDDE3LMmnXgOiE2U5pXWP3P0Scohw4j4IPvBPy3bPienE2vrWdU78bdJ0w"   # ← paste fresh token here daily
+    access_token: str = "paste_your_token_here"   # ← paste fresh token here daily
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
@@ -200,56 +200,81 @@ class DhanFetcher:
                               interval: str = "25", expiry_flag: str = "WEEK",
                               debug: bool = False) -> pd.DataFrame | None:
         """
-        Fetch real option OHLCV via /charts/rollingoption.
-        Identical payload structure to GEX dashboard fetch_rolling_data().
+        Fetch real option OHLCV via /charts/rollingoption — chunked in 89-day windows
+        to avoid DH-905 (max 90 days per call).
         opt_type: "CALL" or "PUT"
         """
         strike_str = "ATM" if strike_offset == 0 else (
             f"ATM+{strike_offset}" if strike_offset > 0 else f"ATM{strike_offset}"
         )
-        payload = {
-            "exchangeSegment": "NSE_FNO",
-            "interval":        interval,
-            "securityId":      security_id,
-            "instrument":      "OPTIDX",
-            "expiryFlag":      expiry_flag,
-            "expiryCode":      1,
-            "strike":          strike_str,
-            "drvOptionType":   opt_type,
-            "requiredData":    ["open", "high", "low", "close", "volume", "oi"],
-            "fromDate":        from_date,
-            "toDate":          to_date,
-        }
-        if debug:
-            st.write("📤 Rolling option payload:", payload)
-        try:
-            r = requests.post(f"{self.base_url}/charts/rollingoption",
-                              headers=self.headers, json=payload, timeout=30)
+        key = "ce" if opt_type == "CALL" else "pe"
+
+        from_dt    = datetime.strptime(from_date, "%Y-%m-%d")
+        to_dt      = datetime.strptime(to_date,   "%Y-%m-%d")
+        total_days = max((to_dt - from_dt).days, 1)
+        all_dfs, fetched = [], 0
+        prog = st.progress(0, text=f"Fetching {strike_str} {opt_type} option data…")
+        cur  = from_dt
+
+        while cur <= to_dt:
+            end = min(cur + timedelta(days=89), to_dt)   # max 89 days per call (DH-905)
+            payload = {
+                "exchangeSegment": "NSE_FNO",
+                "interval":        interval,
+                "securityId":      security_id,
+                "instrument":      "OPTIDX",
+                "expiryFlag":      expiry_flag,
+                "expiryCode":      1,
+                "strike":          strike_str,
+                "drvOptionType":   opt_type,
+                "requiredData":    ["open", "high", "low", "close", "volume", "oi"],
+                "fromDate":        cur.strftime("%Y-%m-%d"),
+                "toDate":          end.strftime("%Y-%m-%d"),
+            }
             if debug:
-                st.write(f"📥 Response {r.status_code}:", r.text[:800])
-            if not r.ok:
-                self._handle_error(r)
+                st.write(f"📤 Rolling option payload ({cur.date()} → {end.date()}):", payload)
+            try:
+                r = requests.post(f"{self.base_url}/charts/rollingoption",
+                                  headers=self.headers, json=payload, timeout=30)
+                if debug:
+                    st.write(f"📥 Response {r.status_code}:", r.text[:600])
+                if not r.ok:
+                    self._handle_error(r)
+                    prog.empty()
+                    return None
+                raw = r.json().get("data", {}).get(key, {})
+                if raw and raw.get("timestamp"):
+                    chunk = pd.DataFrame({
+                        "timestamp": pd.to_datetime(raw["timestamp"], unit="s", utc=True)
+                                       .tz_convert("Asia/Kolkata").tz_localize(None),
+                        "open":   pd.to_numeric(raw.get("open",   []), errors="coerce"),
+                        "high":   pd.to_numeric(raw.get("high",   []), errors="coerce"),
+                        "low":    pd.to_numeric(raw.get("low",    []), errors="coerce"),
+                        "close":  pd.to_numeric(raw.get("close",  []), errors="coerce"),
+                        "volume": pd.to_numeric(raw.get("volume", []), errors="coerce"),
+                        "oi":     pd.to_numeric(raw.get("oi", [np.nan]*len(raw["timestamp"])), errors="coerce"),
+                    }).dropna(subset=["close"])
+                    if not chunk.empty:
+                        all_dfs.append(chunk)
+            except Exception as e:
+                st.error(f"Rolling option chunk error: {e}")
+                prog.empty()
                 return None
-            resp = r.json()
-            key  = "ce" if opt_type == "CALL" else "pe"
-            raw  = resp.get("data", {}).get(key, {})
-            if not raw or not raw.get("timestamp"):
-                st.warning("⚠️ No option data for this strike/range.")
-                return None
-            df = pd.DataFrame({
-                "timestamp": pd.to_datetime(raw["timestamp"], unit="s", utc=True)
-                               .tz_convert("Asia/Kolkata").tz_localize(None),
-                "open":   pd.to_numeric(raw.get("open",   []), errors="coerce"),
-                "high":   pd.to_numeric(raw.get("high",   []), errors="coerce"),
-                "low":    pd.to_numeric(raw.get("low",    []), errors="coerce"),
-                "close":  pd.to_numeric(raw.get("close",  []), errors="coerce"),
-                "volume": pd.to_numeric(raw.get("volume", []), errors="coerce"),
-                "oi":     pd.to_numeric(raw.get("oi", [np.nan]*len(raw["timestamp"])), errors="coerce"),
-            }).dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
-            return df if not df.empty else None
-        except Exception as e:
-            st.error(f"Rolling option error: {e}")
-        return None
+
+            fetched += max((end - cur).days, 1)
+            prog.progress(min(fetched / total_days, 1.0),
+                          text=f"Option data: {cur.date()} → {end.date()}")
+            cur = end + timedelta(days=1)
+            time.sleep(0.3)
+
+        prog.empty()
+        if not all_dfs:
+            st.warning("⚠️ No option data returned for this strike/range.")
+            return None
+        return (pd.concat(all_dfs)
+                  .drop_duplicates("timestamp")
+                  .sort_values("timestamp")
+                  .reset_index(drop=True))
 
 
 # Module-level fetcher instance — uses hardcoded DhanConfig
@@ -371,19 +396,27 @@ def fair_value_gaps(df: pd.DataFrame) -> list[dict]:
 # OPTION BACKTEST ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _norm_cdf(x: float) -> float:
+    """Normal CDF using math.erf — no scipy needed."""
+    import math
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
 def black_scholes_price(S, K, T, r, sigma, option_type="CE"):
-    """Simple Black-Scholes for option premium simulation."""
-    from math import log, sqrt, exp
-    from scipy.stats import norm
-    if T <= 0 or sigma <= 0:
-        intrinsic = max(S - K, 0) if option_type == "CE" else max(K - S, 0)
+    """Black-Scholes using pure math — no scipy."""
+    import math
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        intrinsic = max(S - K, 0) if option_type in ("CE", "CALL") else max(K - S, 0)
         return max(intrinsic, 0.05)
-    d1 = (log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt(T))
-    d2 = d1 - sigma * sqrt(T)
-    if option_type == "CE":
-        return S * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
-    else:
-        return K * exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    try:
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        if option_type in ("CE", "CALL"):
+            return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+        else:
+            return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+    except Exception:
+        return 0.05
 
 
 def simulate_option_prices(df: pd.DataFrame, strike_offset: int,
