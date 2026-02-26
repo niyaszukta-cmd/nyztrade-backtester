@@ -57,7 +57,7 @@ from dataclasses import dataclass
 @dataclass
 class DhanConfig:
     client_id:    str = "1100480354"
-    access_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMTY3OTgxLCJhcHBfaWQiOiJjOTNkM2UwOSIsImlhdCI6MTc3MjA4MTU4MSwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.Kry8jyKMhIR-f1H5R0a2A4I9UHnWdDDE3LMmnXgOiE2U5pXWP3P0Scohw4j4IPvBPy3bPienE2vrWdU78bdJ0w"   # ← paste fresh token here daily
+    access_token: str = "paste_your_token_here"   # ← paste fresh token here daily
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
@@ -444,12 +444,55 @@ def simulate_option_prices(df: pd.DataFrame, strike_offset: int,
     return df
 
 
-def generate_signals(df: pd.DataFrame, buy_lvl: float,
-                      sell_lvl: float) -> pd.DataFrame:
+def generate_signals(df: pd.DataFrame, buy_lvl: float, sell_lvl: float,
+                      ema_filter: bool = True, signal_mode: str = "Flip") -> pd.DataFrame:
+    """
+    signal_mode options:
+      Flip       – entry on BSP level CROSS (needs both buy and sell crosses to fire in sequence)
+      Level Hold – entry while BSP > buy_lvl; exit when BSP returns to 0 zone  [more trades]
+      BSP Only   – no EMA filter, pure BSP threshold  [most trades, useful for long histories]
+    """
     df = df.copy()
-    lc = (df["bsp"] > buy_lvl)  & (df["close"] > df["ema20"]) & (df["ema20"] > df["ema50"])
-    ec = (df["bsp"] < sell_lvl) & (df["close"] < df["ema20"]) & (df["ema20"] < df["ema50"])
-    df["signal"] = np.where(lc, 1, np.where(ec, -1, 0))
+
+    if ema_filter and "ema20" in df.columns and "ema50" in df.columns:
+        bull_trend = (df["close"] > df["ema20"]) & (df["ema20"] > df["ema50"])
+        bear_trend = (df["close"] < df["ema20"]) & (df["ema20"] < df["ema50"])
+    else:
+        bull_trend = pd.Series(True,  index=df.index)
+        bear_trend = pd.Series(True,  index=df.index)
+
+    bsp = df["bsp"]
+
+    if signal_mode == "Level Hold":
+        long_entry  = (bsp > buy_lvl)  & bull_trend
+        short_entry = (bsp < sell_lvl) & bear_trend
+        long_exit   = bsp < 0
+        short_exit  = bsp > 0
+        sigs = [0] * len(df)
+        for i in range(1, len(df)):
+            prev = sigs[i - 1]
+            if long_entry.iloc[i]:
+                sigs[i] = 1
+            elif short_entry.iloc[i]:
+                sigs[i] = -1
+            elif prev == 1 and (long_exit.iloc[i] or short_entry.iloc[i]):
+                sigs[i] = -1
+            elif prev == -1 and (short_exit.iloc[i] or long_entry.iloc[i]):
+                sigs[i] = 1
+            else:
+                sigs[i] = 0
+        df["signal"] = sigs
+        return df
+
+    elif signal_mode == "BSP Only":
+        long_entry  = bsp > buy_lvl
+        short_entry = bsp < sell_lvl
+
+    else:  # Flip — BSP level cross
+        long_entry  = (bsp > buy_lvl)  & (bsp.shift(1) <= buy_lvl)  & bull_trend
+        short_entry = (bsp < sell_lvl) & (bsp.shift(1) >= sell_lvl) & bear_trend
+
+    df["signal"] = np.where(long_entry, 1, np.where(short_entry, -1, 0))
     return df
 
 
@@ -507,8 +550,11 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
         # Spread price = net debit/credit per scale-lot
         spread_price = float(raw_price)
 
-        # ── ENTRY ──────────────────────────────────────────────────────────
-        if sig == 1 and not in_trade:
+        # ── ENTRY — trigger on BUY signal (or SELL signal for short legs) ──
+        # Entry fires on sig==1 (long) or sig==-1 when no position open
+        entry_triggered = (sig == 1 and not in_trade)
+
+        if entry_triggered:
             # Cost basis: |spread_price| × lot_size per scale-lot
             cost_per_lot = abs(spread_price) * lot_size
             if cost_per_lot < 0.01:
@@ -528,8 +574,8 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                 entry_time   = ts
                 in_trade     = True
 
-        # ── EXIT ───────────────────────────────────────────────────────────
-        elif sig == -1 and in_trade:
+        # ── EXIT — on sell signal OR new buy when already in trade ─────────
+        elif in_trade and sig == -1:
             exit_spread = spread_price
             qty         = pos_lots * lot_size  # total underlying units
 
@@ -803,7 +849,25 @@ with st.sidebar:
     vol_threshold = st.slider("Volume Threshold",   1.0, 3.0, 1.5, 0.1)
     vol_period    = st.slider("Volume SMA Period",   5,  30,  14)
 
-    st.markdown('<div class="sidebar-header">📈 EMA Filter</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-header">🎚️ Signal Mode</div>', unsafe_allow_html=True)
+    signal_mode = st.selectbox(
+        "Signal Mode",
+        ["Flip", "Level Hold", "BSP Only"],
+        index=1,
+        help=(
+            "Flip: trade only on BSP level CROSS — fewest signals, can miss trades on long history\n"
+            "Level Hold: enter while BSP above threshold, exit when BSP returns to 0 — balanced\n"
+            "BSP Only: no EMA filter, pure BSP — most signals, good for long backtests"
+        )
+    )
+    ema_filter = st.checkbox(
+        "EMA Trend Filter",
+        value=(signal_mode != "BSP Only"),
+        help="Require EMA20 > EMA50 for longs (and vice-versa). Uncheck for more signals on longer histories.",
+        disabled=(signal_mode == "BSP Only")
+    )
+
+    st.markdown('<div class="sidebar-header">📈 EMA Display</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     with c1:
         show_e20  = st.checkbox("EMA 20",  True)
@@ -873,7 +937,38 @@ if run_btn:
         pl   = pivot_lows(df, pivot_length)
         obs  = order_blocks(df, ph, pl, vol_threshold)
         fvgs = fair_value_gaps(df)
-        df   = generate_signals(df, bsp_buy_lvl, bsp_sell_lvl)
+        df   = generate_signals(df, bsp_buy_lvl, bsp_sell_lvl, ema_filter=ema_filter, signal_mode=signal_mode)
+
+    # ── 2b. Signal Diagnostics ───────────────────────────────────────────────
+    total_bars   = len(df)
+    n_buy_sigs   = int((df["signal"] == 1).sum())
+    n_sell_sigs  = int((df["signal"] == -1).sum())
+    bsp_min      = round(float(df["bsp"].min()), 4)
+    bsp_max      = round(float(df["bsp"].max()), 4)
+
+    with st.expander("🔍 Signal Diagnostics", expanded=(n_buy_sigs == 0 and n_sell_sigs == 0)):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total Bars",   f"{total_bars:,}")
+        c2.metric("Buy Signals",  n_buy_sigs,  delta=None if n_buy_sigs  > 0 else "⚠️ None")
+        c3.metric("Sell Signals", n_sell_sigs, delta=None if n_sell_sigs > 0 else "⚠️ None")
+        c4.metric("BSP Min",  bsp_min)
+        c5.metric("BSP Max",  bsp_max)
+
+        if n_buy_sigs == 0 and n_sell_sigs == 0:
+            st.warning(
+                f"**No signals generated.**\n\n"
+                f"BSP range on this data: **{bsp_min:.4f} → {bsp_max:.4f}**\n\n"
+                f"Your thresholds: Buy > **{bsp_buy_lvl}**, Sell < **{bsp_sell_lvl}**\n\n"
+                f"**Fix options (try in order):**\n"
+                f"1. Switch Signal Mode to **BSP Only** or **Level Hold** (sidebar)\n"
+                f"2. Loosen BSP levels — set Buy to **{round(bsp_max*0.6,3)}** and Sell to **{round(bsp_min*0.6,3)}**\n"
+                f"3. Uncheck **EMA Trend Filter**\n"
+                f"4. Increase BSP Length (longer smoothing)"
+            )
+            # Auto-suggest levels based on actual BSP range
+            suggested_buy  = round(bsp_max * 0.5, 3)
+            suggested_sell = round(bsp_min * 0.5, 3)
+            st.info(f"💡 Auto-suggested levels for this dataset: Buy **{suggested_buy}** / Sell **{suggested_sell}**")
 
     # ── 3. Fetch Option Legs ─────────────────────────────────────────────────
     leg_dfs = []   # one price-series df per leg, aligned to main df index
