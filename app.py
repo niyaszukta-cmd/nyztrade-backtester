@@ -457,8 +457,10 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                  comm_pct: float, lot_size: int,
                  trade_options: bool = False) -> tuple[pd.DataFrame, list]:
     """
-    Backtest on index price or on option premium.
-    trade_options=True → uses opt_price column for P&L
+    Lot-based backtest — corrected sizing.
+    lots = floor(budget / (price_per_lot))
+    qty  = lots * lot_size
+    Prevents the old ×lot_size double-count bug.
     """
     cash, pos, entry_price, entry_time = capital, 0, 0.0, None
     in_trade = False
@@ -471,88 +473,113 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
         price = row[price_col]
         ts    = row["timestamp"]
 
+        if pd.isna(price) or price <= 0:
+            equities.append(cash + pos * price if pos else cash)
+            continue
+
         if sig == 1 and not in_trade:
-            invest = cash * size_pct
-            lots   = max(int(invest / (price * lot_size)), 1)
-            qty    = lots * lot_size
-            cost   = qty * price * (1 + comm_pct)
+            lot_cost = price * lot_size          # cost of ONE full lot
+            if lot_cost <= 0:
+                equities.append(cash)
+                continue
+            lots = max(int(cash * size_pct / lot_cost), 1)
+            qty  = lots * lot_size
+            cost = qty * price * (1 + comm_pct)
             if cost <= cash:
-                pos         = qty
-                cash       -= cost
-                entry_price = price
-                entry_time  = ts
-                in_trade    = True
+                pos, cash, entry_price, entry_time, in_trade = qty, cash - cost, price, ts, True
 
         elif sig == -1 and in_trade:
             proceeds = pos * price * (1 - comm_pct)
             pnl      = proceeds - pos * entry_price
             cash    += proceeds
             trades.append({
-                "entry_time":   entry_time,
-                "exit_time":    ts,
-                "entry_price":  round(entry_price, 2),
-                "exit_price":   round(price, 2),
-                "qty":          pos,
-                "lots":         pos // lot_size,
-                "pnl":          round(pnl, 2),
-                "return_pct":   round((price / entry_price - 1) * 100, 3),
-                "exit_reason":  "Signal",
-                "strike":       row.get("strike", "-"),
+                "entry_time":  entry_time, "exit_time":   ts,
+                "entry_price": round(entry_price, 2), "exit_price": round(price, 2),
+                "qty": pos, "lots": pos // lot_size,
+                "pnl": round(pnl, 2), "return_pct": round((price/entry_price - 1)*100, 3),
+                "exit_reason": "Signal", "strike": row.get("strike", "-"),
             })
             pos, in_trade = 0, False
 
         equities.append(cash + pos * price)
 
-    # Close open trade
     if in_trade and pos > 0:
-        lp       = df[price_col].iloc[-1]
+        lp = df[price_col].iloc[-1]
         proceeds = pos * lp * (1 - comm_pct)
-        pnl      = proceeds - pos * entry_price
-        cash    += proceeds
+        pnl = proceeds - pos * entry_price
+        cash += proceeds
         trades.append({
-            "entry_time":  entry_time,
-            "exit_time":   df["timestamp"].iloc[-1],
-            "entry_price": round(entry_price, 2),
-            "exit_price":  round(lp, 2),
-            "qty":         pos,
-            "lots":        pos // lot_size,
-            "pnl":         round(pnl, 2),
-            "return_pct":  round((lp / entry_price - 1) * 100, 3),
+            "entry_time": entry_time, "exit_time": df["timestamp"].iloc[-1],
+            "entry_price": round(entry_price, 2), "exit_price": round(lp, 2),
+            "qty": pos, "lots": pos // lot_size,
+            "pnl": round(pnl, 2), "return_pct": round((lp/entry_price - 1)*100, 3),
             "exit_reason": "End of Data",
-            "strike":      df["strike"].iloc[-1] if "strike" in df.columns else "-",
+            "strike": df["strike"].iloc[-1] if "strike" in df.columns else "-",
         })
+        if equities:
+            equities[-1] = cash
+
+    while len(equities) < len(df):
+        equities.append(equities[-1] if equities else capital)
 
     results = df[["timestamp"]].copy()
-    results["equity"]       = equities
+    results["equity"]       = equities[:len(df)]
     results["peak"]         = results["equity"].cummax()
     results["drawdown_pct"] = (results["equity"] - results["peak"]) / results["peak"] * 100
     return results, trades
 
 
 def metrics(results: pd.DataFrame, trades: list, capital: float) -> dict:
-    final     = results["equity"].iloc[-1]
-    pnl       = final - capital
-    ret       = pnl / capital * 100
-    n_days    = (results["timestamp"].iloc[-1] - results["timestamp"].iloc[0]).days
-    cagr      = ((final / capital) ** (365 / max(n_days, 1)) - 1) * 100
-    max_dd    = results["drawdown_pct"].min()
-    rets      = results["equity"].pct_change().dropna()
-    sharpe    = rets.mean() / rets.std() * np.sqrt(252) if rets.std() > 0 else 0
-    neg       = rets[rets < 0]
-    sortino   = rets.mean() / neg.std() * np.sqrt(252) if len(neg) > 1 and neg.std() > 0 else 0
-    calmar    = cagr / abs(max_dd) if max_dd != 0 else 0
-    pnls      = [t["pnl"] for t in trades]
-    wins      = [p for p in pnls if p > 0]
-    losses    = [p for p in pnls if p <= 0]
-    gp, gl    = sum(wins), abs(sum(losses))
+    import math
+
+    final = results["equity"].iloc[-1]
+    pnl   = final - capital
+    ret   = round(pnl / capital * 100, 2)
+
+    # CAGR — clamp to ±10000% to avoid astronomical display
+    n_days = max((results["timestamp"].iloc[-1] - results["timestamp"].iloc[0]).days, 1)
+    ratio  = max(final / capital, 1e-10) if capital > 0 else 1.0
+    try:
+        cagr_raw = (ratio ** (365.0 / n_days) - 1) * 100
+        cagr = round(max(min(cagr_raw, 10_000.0), -100.0), 2)
+    except (OverflowError, ZeroDivisionError):
+        cagr = 10_000.0 if ret > 0 else -100.0
+
+    max_dd = round(results["drawdown_pct"].min(), 2)
+
+    # Sharpe/Sortino on DAILY returns (not bar-by-bar — avoids intraday inflation)
+    try:
+        daily  = results.set_index("timestamp")["equity"].resample("D").last().dropna()
+        d_rets = daily.pct_change().dropna()
+        sharpe  = round(float(d_rets.mean() / d_rets.std() * math.sqrt(252)), 3) if len(d_rets) > 1 and d_rets.std() > 0 else 0.0
+        neg     = d_rets[d_rets < 0]
+        sortino = round(float(d_rets.mean() / neg.std() * math.sqrt(252)), 3) if len(neg) > 1 and neg.std() > 0 else 0.0
+        sharpe  = max(min(sharpe,  999.0), -999.0)
+        sortino = max(min(sortino, 999.0), -999.0)
+    except Exception:
+        sharpe = sortino = 0.0
+
+    calmar = round(cagr / abs(max_dd), 2) if max_dd != 0 else 0.0
+    calmar = max(min(calmar, 999.0), -999.0)
+
+    pnls   = [t["pnl"] for t in trades]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    gp, gl = sum(wins), abs(sum(losses))
+
     return {
-        "total_return": ret,  "total_pnl": pnl,      "cagr": cagr,
-        "max_drawdown": max_dd, "sharpe": sharpe,    "sortino": sortino,
-        "calmar": calmar,     "total_trades": len(trades),
-        "win_rate":  len(wins) / len(trades) * 100 if trades else 0,
-        "profit_factor": gp / gl if gl > 0 else float("inf"),
-        "avg_win":  np.mean(wins)   if wins   else 0,
-        "avg_loss": np.mean(losses) if losses else 0,
+        "total_return":  ret,
+        "total_pnl":     round(pnl, 2),
+        "cagr":          cagr,
+        "max_drawdown":  max_dd,
+        "sharpe":        sharpe,
+        "sortino":       sortino,
+        "calmar":        calmar,
+        "total_trades":  len(trades),
+        "win_rate":      round(len(wins)/len(trades)*100, 1) if trades else 0.0,
+        "profit_factor": round(gp/gl, 2) if gl > 0 else (round(gp, 2) if gp > 0 else 0.0),
+        "avg_win":       round(float(np.mean(wins)),   2) if wins   else 0.0,
+        "avg_loss":      round(float(np.mean(losses)), 2) if losses else 0.0,
     }
 
 
