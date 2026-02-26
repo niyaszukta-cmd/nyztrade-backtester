@@ -111,9 +111,17 @@ class DhanFetcher:
         Daily (D):                POST /charts/historical
                                   exchangeSegment=IDX_I, instrument=INDEX
         """
+        # Dhan natively supports: 1, 5, 15, 25, 60
+        # 3-min and 10-min are fetched as 1-min and resampled client-side
+        RESAMPLE_MAP = {"3": ("1", 3), "10": ("1", 10)}
+        resample_to = None
+        fetch_interval = interval
+        if interval in RESAMPLE_MAP:
+            fetch_interval, resample_to = RESAMPLE_MAP[interval]
+
         intraday_set = {"1", "5", "15", "25", "60"}
 
-        if interval in intraday_set:
+        if fetch_interval in intraday_set:
             from_dt    = datetime.strptime(from_date, "%Y-%m-%d")
             to_dt      = datetime.strptime(to_date,   "%Y-%m-%d")
             total_days = max((to_dt - from_dt).days, 1)
@@ -500,7 +508,9 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                  comm_pct: float, lot_size: int,
                  trade_options: bool = False,
                  fixed_lots: int = None,
-                 spread_legs: list = None) -> tuple[pd.DataFrame, list]:
+                 spread_legs: list = None,
+                 is_intraday: bool = False,
+                 eod_exit_time=None) -> tuple[pd.DataFrame, list]:
     """
     Spread-aware lot-based backtest.
 
@@ -511,6 +521,9 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
     Sizing:
       fixed_lots → that many SCALE lots (each leg uses its own leg["lots"] ratio)
       % of Capital → lots = floor(budget / |spread_cost_per_lot|)
+
+    is_intraday: force-close all positions at eod_exit_time each trading day
+    eod_exit_time: datetime.time object for EOD square-off (default 15:15)
     """
     cash, pos_lots, entry_spread, entry_time = capital, 0, 0.0, None
     in_trade = False
@@ -538,6 +551,13 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
 
     df_ts = df["timestamp"].values  # fast numpy access
 
+    import datetime as _dt
+    # Resolve EOD exit time
+    if is_intraday and eod_exit_time is not None:
+        _eod_h, _eod_m = eod_exit_time.hour, eod_exit_time.minute
+    else:
+        _eod_h, _eod_m = 15, 15   # default fallback
+
     for row_i, row in df.iterrows():
         sig = row["signal"]
         ts  = row["timestamp"]
@@ -550,9 +570,50 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
         # Spread price = net debit/credit per scale-lot
         spread_price = float(raw_price)
 
+        # ── INTRADAY EOD FORCE-CLOSE ──────────────────────────────────────
+        # If Intraday mode: square off at/after eod_exit_time on each day
+        if is_intraday and in_trade:
+            bar_time = ts.time() if hasattr(ts, "time") else (
+                _dt.datetime.fromtimestamp(ts.timestamp()).time()
+                if hasattr(ts, "timestamp") else None
+            )
+            if bar_time and bar_time >= _dt.time(_eod_h, _eod_m):
+                eod_spread = spread_price
+                qty        = pos_lots * lot_size
+                pnl        = (eod_spread - entry_spread) * qty - abs(eod_spread) * qty * comm_pct
+                cash      += abs(entry_spread) * qty + pnl
+                trade_rec  = {
+                    "entry_time":  entry_time, "exit_time": ts,
+                    "entry_price": round(entry_spread, 2), "exit_price": round(eod_spread, 2),
+                    "qty": qty, "lots": pos_lots,
+                    "pnl": round(pnl, 2),
+                    "return_pct": round((eod_spread / entry_spread - 1) * 100, 2) if entry_spread != 0 else 0.0,
+                    "exit_reason": "EOD Square-off",
+                    "strike": row.get("strike", "-"),
+                }
+                if is_spread and spread_legs:
+                    for i, ld in enumerate(spread_legs):
+                        lp_arr = leg_price_series.get(i)
+                        if lp_arr is not None and row_i < len(lp_arr):
+                            try:
+                                eidx = list(df_ts).index(entry_time)
+                                ep = float(lp_arr[eidx]); xp = float(lp_arr[row_i])
+                            except (ValueError, IndexError):
+                                ep = xp = 0.0
+                            sign = 1 if ld["direction"] == "BUY" else -1
+                            trade_rec[f"leg{i+1}_{ld['strike_lbl']}_{ld['opt_type']}"] = round(
+                                sign * (xp - ep) * ld["lots"] * lot_size, 2)
+                trades.append(trade_rec)
+                pos_lots, in_trade = 0, False
+                equities.append(cash)
+                continue  # skip further processing for this bar
+
         # ── ENTRY — trigger on BUY signal (or SELL signal for short legs) ──
         # Entry fires on sig==1 (long) or sig==-1 when no position open
-        entry_triggered = (sig == 1 and not in_trade)
+        # In Intraday mode: block new entries after EOD time
+        _bar_time_now = ts.time() if hasattr(ts, "time") else None
+        _block_entry  = is_intraday and _bar_time_now and _bar_time_now >= _dt.time(_eod_h, _eod_m)
+        entry_triggered = (sig == 1 and not in_trade and not _block_entry)
 
         if entry_triggered:
             # Cost basis: |spread_price| × lot_size per scale-lot
@@ -740,16 +801,50 @@ with st.sidebar:
 
     st.caption(f"Lot Size: **{lot_size}** | Strike Gap: **{strike_gap}**")
 
-    interval_map = {
-        "1 Min":"1", "5 Min":"5", "15 Min":"15",
-        "25 Min":"25", "60 Min":"60", "Daily":"D"
-    }
-    interval_lbl = st.selectbox("Timeframe", list(interval_map.keys()), index=3)
-    interval     = interval_map[interval_lbl]
+    # ── Trade Style ────────────────────────────────────────────────────────
+    trade_style = st.radio(
+        "Trade Style",
+        ["📈 Intraday", "🌙 Carry Forward"],
+        horizontal=True,
+        help="Intraday: positions force-squared off at EOD each day.\n"
+             "Carry Forward: positions held overnight until exit signal fires.",
+    )
+    is_intraday = trade_style == "📈 Intraday"
+
+    if is_intraday:
+        INTRADAY_TF = {
+            "1 Min": "1", "3 Min": "3", "5 Min": "5",
+            "10 Min": "10", "15 Min": "15", "25 Min": "25",
+        }
+        interval_lbl = st.selectbox("Timeframe", list(INTRADAY_TF.keys()), index=2,
+                                     help="Intraday timeframes only")
+        interval     = INTRADAY_TF[interval_lbl]
+        c_eod1, c_eod2 = st.columns(2)
+        with c_eod1:
+            eod_hour   = st.number_input("EOD Exit Hour",   min_value=9,  max_value=15, value=15, step=1)
+        with c_eod2:
+            eod_minute = st.number_input("EOD Exit Minute", min_value=0,  max_value=59, value=15, step=5)
+        import datetime as _dt2
+        eod_exit_time = _dt2.time(int(eod_hour), int(eod_minute))
+    else:
+        CF_TF = {
+            "5 Min": "5", "15 Min": "15", "25 Min": "25",
+            "60 Min": "60", "Daily": "D",
+        }
+        interval_lbl = st.selectbox("Timeframe", list(CF_TF.keys()), index=4,
+                                     help="Carry Forward — positions held overnight")
+        interval     = CF_TF[interval_lbl]
+        eod_exit_time = None
 
     c1, c2 = st.columns(2)
-    with c1: from_date = st.date_input("From", datetime.now() - timedelta(days=365))
-    with c2: to_date   = st.date_input("To",   datetime.now())
+    with c1:
+        default_from = (datetime.now() - timedelta(days=30)) if is_intraday else (datetime.now() - timedelta(days=365))
+        from_date = st.date_input("From", default_from)
+    with c2:
+        to_date = st.date_input("To", datetime.now())
+
+    if is_intraday and (to_date - from_date).days > 90:
+        st.warning("⚠️ Intraday data: Dhan API allows max ~90 days per call. Consider shorter ranges for speed.")
 
     # ── Backtest Mode ────────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-header">🎯 Backtest Mode</div>', unsafe_allow_html=True)
@@ -886,6 +981,27 @@ with st.sidebar:
         fixed_lots   = st.number_input("Fixed Lots per Trade", min_value=1, max_value=100, value=1, step=1)
         pos_size_pct = 100   # unused in fixed mode, placeholder
     comm_pct = st.number_input("Commission (%)", value=0.03, step=0.01, format="%.3f")
+
+    st.markdown('<div class="sidebar-header">🔄 Trade Style</div>', unsafe_allow_html=True)
+    trade_style = st.radio(
+        "Position Carrying",
+        ["📅 Intraday (MIS)", "📆 Carry Forward (NRML)"],
+        index=0,
+        help=(
+            "Intraday (MIS): All open positions are force-closed at 15:15 IST each day.\n"
+            "Carry Forward (NRML): Positions can be held overnight across multiple days."
+        )
+    )
+    is_intraday = (trade_style == "📅 Intraday (MIS)")
+
+    if is_intraday:
+        eod_exit_time = st.time_input(
+            "EOD Square-off Time",
+            value=__import__("datetime").time(15, 15),
+            help="Force-close all positions at this time each day (default 15:15 IST)"
+        )
+    else:
+        eod_exit_time = None
 
     st.markdown('<div class="sidebar-header">🛠️ Debug</div>', unsafe_allow_html=True)
     debug_mode = st.checkbox("Show API request/response", False,
@@ -1034,19 +1150,23 @@ if run_btn:
             df, init_capital, pos_size_pct / 100,
             comm_pct / 100, lot_size, trade_options,
             fixed_lots=fixed_lots,
-            spread_legs=leg_dfs if trade_options else None
+            spread_legs=leg_dfs if trade_options else None,
+            is_intraday=is_intraday,
+            eod_exit_time=eod_exit_time
         )
         m = metrics(results, trades, init_capital)
 
     # ── 5. Mode Banner ────────────────────────────────────────────────────────
+    style_tag = "📅 MIS (Intraday)" if is_intraday else "📆 NRML (Carry Forward)"
+    eod_tag   = f" · EOD {eod_exit_time.strftime('%H:%M')}" if is_intraday and eod_exit_time else ""
     if trade_options:
         leg_summaries = " | ".join(
             f"{lg['direction']} {lg['lots']}L {lg['strike_lbl']} {lg['opt_type']}"
             for lg in option_legs
         )
-        st.info(f"📌 **Options Mode** | {index_name} | {leg_summaries} | {expiry_flag}")
+        st.info(f"📌 **Options Mode** · {style_tag}{eod_tag} | {index_name} | {interval_lbl} | {leg_summaries} | {expiry_flag}")
     else:
-        st.info(f"📈 **Index Mode** | {index_name} | Lot Size: {lot_size}")
+        st.info(f"**{style_tag}**{eod_tag} · Index Mode | {index_name} | {interval_lbl} | Lot Size: {lot_size}")
 
     # ── 4. KPIs ───────────────────────────────────────────────────────────────
     st.markdown("### 📊 Performance")
