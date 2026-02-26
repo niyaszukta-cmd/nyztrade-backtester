@@ -48,270 +48,215 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONSTANTS — INDICES
+# DHAN CONFIG — identical pattern to GEX Dashboard
+# Update access_token daily. client_id never changes.
 # ══════════════════════════════════════════════════════════════════════════════
 
-INDICES = {
-    "NIFTY 50":       {"security_id": "13",  "segment": "IDX_I", "lot_size": 75,  "strike_gap": 50},
-    "BANKNIFTY":      {"security_id": "25",  "segment": "IDX_I", "lot_size": 30,  "strike_gap": 100},
-    "FINNIFTY":       {"security_id": "27",  "segment": "IDX_I", "lot_size": 65,  "strike_gap": 50},
-    "MIDCPNIFTY":     {"security_id": "442", "segment": "IDX_I", "lot_size": 75,  "strike_gap": 25},
-    "SENSEX":         {"security_id": "1",   "segment": "IDX_I", "lot_size": 10,  "strike_gap": 100},
-    "BANKEX":         {"security_id": "12",  "segment": "IDX_I", "lot_size": 15,  "strike_gap": 100},
-}
+from dataclasses import dataclass
+
+@dataclass
+class DhanConfig:
+    client_id:    str = "1100480354"
+    access_token: str = "paste_your_token_here"   # ← paste fresh token here daily
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
-# ── Dhan segment/instrument combos for indices ────────────────────────────────
-# Intraday  (/charts/intraday):   IDX_I  + INDEX  (fromDate must include time HH:MM:SS)
-# Daily     (/charts/historical): IDX_I  + INDEX  (fromDate is date only YYYY-MM-DD)
-# Rolling option (/charts/rollingoption): NSE_FNO + OPTIDX
-# NOTE: client-id header must NOT be sent for chart endpoints — causes DH-901 401 error
-HISTORICAL_SEGMENT = "IDX_I"
+INDICES = {
+    "NIFTY 50":   {"security_id": 13,  "lot_size": 75,  "strike_gap": 50},
+    "BANKNIFTY":  {"security_id": 25,  "lot_size": 30,  "strike_gap": 100},
+    "FINNIFTY":   {"security_id": 27,  "lot_size": 65,  "strike_gap": 50},
+    "MIDCPNIFTY": {"security_id": 442, "lot_size": 75,  "strike_gap": 25},
+    "SENSEX":     {"security_id": 1,   "lot_size": 10,  "strike_gap": 100},
+    "BANKEX":     {"security_id": 12,  "lot_size": 15,  "strike_gap": 100},
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DHAN API
+# DHAN FETCHER CLASS — mirrors GEX Dashboard's UnifiedOptionsFetcher exactly
+# No token passed anywhere. self.headers used on every request.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_client_id(token: str) -> str:
-    """Extract dhanClientId from JWT payload — no hardcoding."""
-    import base64, json as _json
-    try:
-        part = token.split(".")[1]
-        part += "=" * (4 - len(part) % 4)
-        return str(_json.loads(base64.urlsafe_b64decode(part)).get("dhanClientId", ""))
-    except Exception:
-        return ""
+class DhanFetcher:
+    def __init__(self, config: DhanConfig):
+        self.config = config
+        # Identical header structure to GEX Dashboard
+        self.headers = {
+            "access-token": config.access_token,
+            "client-id":    config.client_id,
+            "Content-Type": "application/json",
+        }
+        self.base_url = DHAN_BASE
 
+    def _handle_error(self, r: requests.Response) -> None:
+        code, body = r.status_code, r.text[:400]
+        if code == 401:
+            st.error("❌ **401** — Token expired/invalid. Update `access_token` in DhanConfig and restart.")
+        elif code == 429:
+            st.error("❌ **429** — Rate limit hit. Wait 60 s and retry.")
+        elif code == 400:
+            st.error(f"❌ **400 Bad Request** — `{body}`")
+        else:
+            st.error(f"❌ **HTTP {code}** — `{body}`")
 
-def dhan_headers(token: str, include_client_id: bool = False) -> dict:
-    """
-    Dhan API headers.
-    Charts/historical endpoints: only access-token needed (client-id causes 401)
-    Option chain endpoints: need both access-token AND client-id
-    """
-    h = {
-        "access-token": token,
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-    }
-    if include_client_id:
-        h["client-id"] = extract_client_id(token)
-    return h
+    def fetch_index_ohlcv(self, security_id: int, from_date: str,
+                           to_date: str, interval: str,
+                           debug: bool = False) -> pd.DataFrame | None:
+        """
+        Fetch index OHLCV — same approach as GEX dashboard fetch_rolling_data.
 
+        Intraday (1/5/15/25/60):  POST /charts/intraday
+                                  exchangeSegment=IDX_I, instrument=INDEX
+                                  fromDate/toDate include time  HH:MM:SS
 
-def _show_api_error(r: requests.Response) -> None:
-    """Show a clear, actionable error for each HTTP status."""
-    code = r.status_code
-    body = r.text[:400]
-    if code == 401:
-        st.error("❌ **401 Unauthorized** — Your token has expired or is invalid.\n\n"
-                 "Generate a new token from **dhanhq.co → My Profile → API Access** and paste it above.")
-    elif code == 429:
-        st.error("❌ **429 Too Many Requests** — Dhan rate limit hit. Wait 60 s and retry.")
-    elif code == 400:
-        st.error(f"❌ **400 Bad Request** — Check Security ID / date range.\n`{body}`")
-    else:
-        st.error(f"❌ **HTTP {code}** — `{body}`")
+        Daily (D):                POST /charts/historical
+                                  exchangeSegment=IDX_I, instrument=INDEX
+        """
+        intraday_set = {"1", "5", "15", "25", "60"}
 
+        if interval in intraday_set:
+            from_dt    = datetime.strptime(from_date, "%Y-%m-%d")
+            to_dt      = datetime.strptime(to_date,   "%Y-%m-%d")
+            total_days = max((to_dt - from_dt).days, 1)
+            all_dfs, fetched = [], 0
+            prog = st.progress(0, text="Fetching intraday data…")
+            cur  = from_dt
 
-def fetch_index_ohlcv(token: str, security_id: str,
-                       from_date: str, to_date: str,
-                       interval: str,
-                       debug: bool = False) -> pd.DataFrame | None:
-    """
-    Fetch index OHLCV from Dhan.
-
-    Intraday (1/5/15/25/60):
-        POST /v2/charts/intraday  |  exchangeSegment=NSE_FNO, instrument=INDEX
-
-    Daily:
-        POST /v2/charts/historical  |  exchangeSegment=IDX_I, instrument=INDEX
-    """
-    headers      = dhan_headers(token)
-    intraday_set = {"1", "5", "15", "25", "60"}
-
-    if interval in intraday_set:
-        from_dt    = datetime.strptime(from_date, "%Y-%m-%d")
-        to_dt      = datetime.strptime(to_date,   "%Y-%m-%d")
-        total_days = max((to_dt - from_dt).days, 1)
-        all_dfs, fetched = [], 0
-        prog = st.progress(0, text="Fetching intraday data from Dhan…")
-        cur  = from_dt
-
-        while cur <= to_dt:
-            end = min(cur + timedelta(days=90), to_dt)
-            # Dhan intraday requires datetime format with time component
-            payload = {
-                "securityId":      str(security_id),
-                "exchangeSegment": "IDX_I",
-                "instrument":      "INDEX",
-                "interval":        interval,
-                "fromDate":        cur.strftime("%Y-%m-%d") + " 09:15:00",
-                "toDate":          end.strftime("%Y-%m-%d") + " 15:30:00",
-            }
-            if debug:
-                st.write("📤 **Intraday payload:**", payload)
-
-            try:
-                r = requests.post(f"{DHAN_BASE}/charts/intraday",
-                                  json=payload, headers=dhan_headers(token), timeout=30)
+            while cur <= to_dt:
+                end = min(cur + timedelta(days=90), to_dt)
+                payload = {
+                    "securityId":      security_id,
+                    "exchangeSegment": "IDX_I",
+                    "instrument":      "INDEX",
+                    "interval":        interval,
+                    "fromDate":        cur.strftime("%Y-%m-%d") + " 09:15:00",
+                    "toDate":          end.strftime("%Y-%m-%d") + " 15:30:00",
+                }
                 if debug:
-                    st.write(f"📥 **Response {r.status_code}:**", r.text[:600])
-
-                if not r.ok:
-                    _show_api_error(r)
+                    st.write("📤 Intraday payload:", payload)
+                try:
+                    r = requests.post(f"{self.base_url}/charts/intraday",
+                                      headers=self.headers, json=payload, timeout=30)
+                    if debug:
+                        st.write(f"📥 Response {r.status_code}:", r.text[:600])
+                    if not r.ok:
+                        self._handle_error(r)
+                        prog.empty()
+                        return None
+                    data = r.json()
+                    if isinstance(data, dict) and "data" in data:
+                        data = data["data"]
+                    df = _parse_ohlcv(data)
+                    if df is not None:
+                        all_dfs.append(df)
+                except Exception as e:
+                    st.error(f"Request error: {e}")
+                    prog.empty()
                     return None
 
+                fetched += max((end - cur).days, 1)
+                prog.progress(min(fetched / total_days, 1.0),
+                              text=f"Fetched {cur.date()} → {end.date()}")
+                cur = end + timedelta(days=1)
+                time.sleep(0.3)
+
+            prog.empty()
+            if not all_dfs:
+                st.warning("⚠️ No data returned. Try Daily timeframe or shorter date range.")
+                return None
+            return (pd.concat(all_dfs)
+                      .drop_duplicates("timestamp")
+                      .sort_values("timestamp")
+                      .reset_index(drop=True))
+
+        else:
+            payload = {
+                "securityId":      security_id,
+                "exchangeSegment": "IDX_I",
+                "instrument":      "INDEX",
+                "fromDate":        from_date,
+                "toDate":          to_date,
+                "expiryCode":      0,
+            }
+            if debug:
+                st.write("📤 Daily payload:", payload)
+            try:
+                r = requests.post(f"{self.base_url}/charts/historical",
+                                  headers=self.headers, json=payload, timeout=30)
+                if debug:
+                    st.write(f"📥 Response {r.status_code}:", r.text[:600])
+                if not r.ok:
+                    self._handle_error(r)
+                    return None
                 data = r.json()
                 if isinstance(data, dict) and "data" in data:
                     data = data["data"]
-                df = _parse(data)
-                if df is not None:
-                    all_dfs.append(df)
-
+                return _parse_ohlcv(data)
             except Exception as e:
                 st.error(f"Request error: {e}")
-                return None
-
-            fetched += (end - cur).days
-            prog.progress(min(fetched / total_days, 1.0),
-                          text=f"Fetching {cur.date()} → {end.date()}")
-            cur = end + timedelta(days=1)
-            time.sleep(0.3)
-
-        prog.empty()
-        if not all_dfs:
-            st.warning("⚠️ API returned no bars for this range. Try a shorter date range or different timeframe.")
             return None
-        return (pd.concat(all_dfs)
-                  .drop_duplicates("timestamp")
-                  .sort_values("timestamp")
-                  .reset_index(drop=True))
 
-    else:
+    def fetch_rolling_option(self, security_id: int, strike_offset: int,
+                              opt_type: str, from_date: str, to_date: str,
+                              interval: str = "25", expiry_flag: str = "WEEK",
+                              debug: bool = False) -> pd.DataFrame | None:
+        """
+        Fetch real option OHLCV via /charts/rollingoption.
+        Identical payload structure to GEX dashboard fetch_rolling_data().
+        opt_type: "CALL" or "PUT"
+        """
+        strike_str = "ATM" if strike_offset == 0 else (
+            f"ATM+{strike_offset}" if strike_offset > 0 else f"ATM{strike_offset}"
+        )
         payload = {
-            "securityId":      str(security_id),
-            "exchangeSegment": HISTORICAL_SEGMENT,
-            "instrument":      "INDEX",
+            "exchangeSegment": "NSE_FNO",
+            "interval":        interval,
+            "securityId":      security_id,
+            "instrument":      "OPTIDX",
+            "expiryFlag":      expiry_flag,
+            "expiryCode":      1,
+            "strike":          strike_str,
+            "drvOptionType":   opt_type,
+            "requiredData":    ["open", "high", "low", "close", "volume", "oi"],
             "fromDate":        from_date,
             "toDate":          to_date,
-            "expiryCode":      0,
         }
         if debug:
-            st.write("📤 **Daily payload:**", payload)
-
+            st.write("📤 Rolling option payload:", payload)
         try:
-            r = requests.post(f"{DHAN_BASE}/charts/historical",
-                              json=payload, headers=dhan_headers(token), timeout=30)
+            r = requests.post(f"{self.base_url}/charts/rollingoption",
+                              headers=self.headers, json=payload, timeout=30)
             if debug:
-                st.write(f"📥 **Response {r.status_code}:**", r.text[:600])
-
+                st.write(f"📥 Response {r.status_code}:", r.text[:800])
             if not r.ok:
-                _show_api_error(r)
+                self._handle_error(r)
                 return None
-
-            data = r.json()
-            if isinstance(data, dict) and "data" in data:
-                data = data["data"]
-            return _parse(data)
-
+            resp = r.json()
+            key  = "ce" if opt_type == "CALL" else "pe"
+            raw  = resp.get("data", {}).get(key, {})
+            if not raw or not raw.get("timestamp"):
+                st.warning("⚠️ No option data for this strike/range.")
+                return None
+            df = pd.DataFrame({
+                "timestamp": pd.to_datetime(raw["timestamp"], unit="s", utc=True)
+                               .tz_convert("Asia/Kolkata").tz_localize(None),
+                "open":   pd.to_numeric(raw.get("open",   []), errors="coerce"),
+                "high":   pd.to_numeric(raw.get("high",   []), errors="coerce"),
+                "low":    pd.to_numeric(raw.get("low",    []), errors="coerce"),
+                "close":  pd.to_numeric(raw.get("close",  []), errors="coerce"),
+                "volume": pd.to_numeric(raw.get("volume", []), errors="coerce"),
+                "oi":     pd.to_numeric(raw.get("oi", [np.nan]*len(raw["timestamp"])), errors="coerce"),
+            }).dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+            return df if not df.empty else None
         except Exception as e:
-            st.error(f"Request error: {e}")
+            st.error(f"Rolling option error: {e}")
         return None
 
 
-def fetch_rolling_option(token: str, security_id: str,
-                          strike_offset: int, opt_type: str,
-                          from_date: str, to_date: str,
-                          interval: str = "25",
-                          expiry_flag: str = "WEEK",
-                          debug: bool = False) -> pd.DataFrame | None:
-    """
-    Fetch REAL option OHLCV using Dhan's /charts/rollingoption endpoint.
-    Returns actual historical option premium — no simulation needed.
-
-    strike_offset: 0=ATM, 1=ATM+1, -1=ATM-1, etc. (max ±10 for index near expiry)
-    opt_type: "CALL" or "PUT"
-    expiry_flag: "WEEK" or "MONTH"
-    """
-    headers = dhan_headers(token)
-
-    strike_str = "ATM" if strike_offset == 0 else (
-        f"ATM+{strike_offset}" if strike_offset > 0 else f"ATM{strike_offset}"
-    )
-
-    payload = {
-        "exchangeSegment": "NSE_FNO",
-        "interval":        interval,
-        "securityId":      int(security_id),
-        "instrument":      "OPTIDX",
-        "expiryFlag":      expiry_flag,
-        "expiryCode":      1,
-        "strike":          strike_str,
-        "drvOptionType":   opt_type,
-        "requiredData":    ["open", "high", "low", "close", "volume", "oi"],
-        "fromDate":        from_date,
-        "toDate":          to_date,
-    }
-    if debug:
-        st.write("📤 **Rolling option payload:**", payload)
-
-    try:
-        r = requests.post(f"{DHAN_BASE}/charts/rollingoption",
-                          json=payload, headers=headers, timeout=30)
-        if debug:
-            st.write(f"📥 **Response {r.status_code}:**", r.text[:800])
-
-        if not r.ok:
-            _show_api_error(r)
-            return None
-
-        resp = r.json()
-        key  = "ce" if opt_type == "CALL" else "pe"
-        raw  = resp.get("data", {}).get(key, {})
-
-        if not raw or not raw.get("timestamp"):
-            st.warning("⚠️ No option data returned for this strike/date range.")
-            return None
-
-        df = pd.DataFrame({
-            "timestamp": pd.to_datetime(raw["timestamp"], unit="s", utc=True)
-                           .tz_convert("Asia/Kolkata").tz_localize(None),
-            "open":   pd.to_numeric(raw.get("open",   []), errors="coerce"),
-            "high":   pd.to_numeric(raw.get("high",   []), errors="coerce"),
-            "low":    pd.to_numeric(raw.get("low",    []), errors="coerce"),
-            "close":  pd.to_numeric(raw.get("close",  []), errors="coerce"),
-            "volume": pd.to_numeric(raw.get("volume", []), errors="coerce"),
-            "oi":     pd.to_numeric(raw.get("oi",     [np.nan]*len(raw["timestamp"])), errors="coerce"),
-        }).dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
-
-        return df if not df.empty else None
-
-    except Exception as e:
-        st.error(f"Rolling option fetch error: {e}")
-    return None
+# Module-level fetcher instance — uses hardcoded DhanConfig
+_fetcher = DhanFetcher(DhanConfig())
 
 
-def fetch_option_chain(token: str, security_id: str,
-                        under_seg: str = "IDX_I") -> dict | None:
-    """Fetch live option chain to get ATM strike and expiry list."""
-    headers = dhan_headers(token)
-    try:
-        r = requests.get(
-            f"{DHAN_BASE}/optionchain/expirylist",
-            params={"UnderlyingScrip": security_id, "UnderlyingSegment": under_seg},
-            headers=headers, timeout=10
-        )
-        if r.ok:
-            return r.json()
-    except Exception:
-        pass
-    return None
-
-
-def _parse(data: dict) -> pd.DataFrame | None:
+def _parse_ohlcv(data: dict) -> pd.DataFrame | None:
     if not data or "open" not in data or not data.get("timestamp"):
         return None
     df = pd.DataFrame({
@@ -584,21 +529,12 @@ def metrics(results: pd.DataFrame, trades: list, capital: float) -> dict:
 
 with st.sidebar:
 
-    # ── Access Token ─────────────────────────────────────────────────────────
-    st.markdown("### 🔑 Dhan Access Token")
-    access_token = st.text_input(
-        "Paste your Access Token",
-        type="password",
-        help="Get it from dhanhq.co → My Profile → API Access. Valid for 24h."
-    )
-    if access_token:
-        client_id_decoded = extract_client_id(access_token)
-        if client_id_decoded:
-            st.success(f"✅ Token OK · Client ID: `{client_id_decoded}`")
-        else:
-            st.warning("⚠️ Token received but Client ID not decoded")
+    # ── Token Status ─────────────────────────────────────────────────────────
+    cfg = DhanConfig()
+    if cfg.access_token and cfg.access_token != "paste_your_token_here":
+        st.success(f"✅ Token configured · Client: `{cfg.client_id}`")
     else:
-        st.warning("⚠️ Token required to fetch data")
+        st.error("❌ Token not set — update `access_token` in DhanConfig at top of app.py")
 
     # ── Index Selection ──────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-header">📊 Index Settings</div>', unsafe_allow_html=True)
@@ -702,14 +638,9 @@ st.divider()
 # ══════════════════════════════════════════════════════════════════════════════
 
 if run_btn:
-    if not access_token:
-        st.error("⚠️ Please paste your Dhan Access Token in the sidebar.")
-        st.stop()
-
-    # ── 1. Fetch Index OHLCV (always needed for signals) ─────────────────────
+    # ── 1. Fetch Index OHLCV ─────────────────────────────────────────────────
     with st.spinner(f"📡 Fetching {index_name} OHLCV from Dhan…"):
-        df = fetch_index_ohlcv(
-            access_token,
+        df = _fetcher.fetch_index_ohlcv(
             idx_cfg["security_id"],
             from_date.strftime("%Y-%m-%d"),
             to_date.strftime("%Y-%m-%d"),
@@ -742,8 +673,7 @@ if run_btn:
     opt_df = None
     if trade_options:
         with st.spinner(f"📡 Fetching {get_strike_label(strike_offset)} {opt_type} option data…"):
-            opt_df = fetch_rolling_option(
-                access_token,
+            opt_df = _fetcher.fetch_rolling_option(
                 idx_cfg["security_id"],
                 strike_offset, opt_type,
                 from_date.strftime("%Y-%m-%d"),
@@ -767,7 +697,7 @@ if run_btn:
         else:
             st.warning("⚠️ Option data unavailable. Falling back to Black-Scholes simulation.")
             df = simulate_option_prices(df, strike_offset, strike_gap,
-                                         "CE" if opt_type=="CALL" else "PE", 7, 0.15)
+                                         opt_type, 7, 0.15)
 
     # ── 4. Run Backtest ───────────────────────────────────────────────────────
     with st.spinner("📊 Running backtest…"):
