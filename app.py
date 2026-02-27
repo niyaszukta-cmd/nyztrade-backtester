@@ -57,7 +57,7 @@ from dataclasses import dataclass
 @dataclass
 class DhanConfig:
     client_id:    str = "1100480354"
-    access_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMjU3MTI2LCJhcHBfaWQiOiJjOTNkM2UwOSIsImlhdCI6MTc3MjE3MDcyNiwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.kJ6mEUuujMFz8Bte9MCdsg_lF94hTq1xtygSBLzXqhYCb2JfvLbAEYS7pOJtEV424qEgCTg80N4c_a2rRMRRZQ"   # ← paste fresh token here daily
+    access_token: str = "paste_your_token_here"   # ← paste fresh token here daily
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
@@ -1027,7 +1027,7 @@ with st.sidebar:
     if is_intraday:
         INTRADAY_TF = {
             "1 Min": "1", "3 Min": "3", "5 Min": "5",
-            "10 Min": "10", "15 Min": "15", "25 Min": "25",
+            "10 Min": "10", "15 Min": "15", "25 Min": "25", "60 Min (1 Hr)": "60",
         }
         interval_lbl = st.selectbox("Timeframe", list(INTRADAY_TF.keys()), index=2,
                                      help="Intraday timeframes only")
@@ -1326,11 +1326,11 @@ if run_btn:
 
         # ── Metrics Banner ────────────────────────────────────────────────
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Net P&L",        f"₹{m['net_pnl']:,.0f}")
-        c2.metric("Total Return",   f"{m['total_return_pct']:.1f}%")
+        c1.metric("Net P&L",        f"₹{m['total_pnl']:,.0f}")
+        c2.metric("Total Return",   f"{m['total_return']*100:.1f}%")
         c3.metric("Total Trades",   m["total_trades"])
         c4.metric("Win Rate",       f"{m['win_rate']:.1f}%")
-        c5.metric("Max Drawdown",   f"{m['max_dd']:.1f}%")
+        c5.metric("Max Drawdown",   f"{m['max_drawdown']:.1f}%")
         c6.metric("Sharpe Ratio",   f"{m['sharpe']:.2f}")
 
         # ── CE / PE split ─────────────────────────────────────────────────
