@@ -1029,7 +1029,7 @@ with st.sidebar:
             "1 Min": "1", "3 Min": "3", "5 Min": "5",
             "10 Min": "10", "15 Min": "15", "25 Min": "25", "60 Min (1 Hr)": "60",
         }
-        interval_lbl = st.selectbox("Timeframe", list(INTRADAY_TF.keys()), index=2,
+        interval_lbl = st.selectbox("Timeframe", list(INTRADAY_TF.keys()), index=5,
                                      help="Intraday timeframes only")
         interval     = INTRADAY_TF[interval_lbl]
         c_eod1, c_eod2 = st.columns(2)
