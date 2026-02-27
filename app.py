@@ -937,6 +937,165 @@ def run_backtest_dual(
     return results, trades
 
 
+def run_backtest_alternating(
+    df: pd.DataFrame,
+    ce_df: pd.DataFrame,
+    pe_df: pd.DataFrame,
+    capital: float,
+    size_pct: float,
+    comm_pct: float,
+    lot_size: int,
+    fixed_lots: int = None,
+    is_intraday: bool = False,
+    eod_exit_time=None,
+) -> tuple[pd.DataFrame, list]:
+    """
+    CE/PE Alternating State Machine — mirrors Pine Script logic exactly:
+
+        BUY signal  → if PE open: close PE first → open CE
+                      if flat:                       open CE
+                      if CE open:                    do nothing (no re-entry)
+
+        SELL signal → if CE open: close CE first → open PE
+                      if flat:                       open PE
+                      if PE open:                    do nothing
+
+    ce_df / pe_df: raw option OHLCV (close = premium price per unit)
+    Both are aligned to df index by timestamp.
+
+    Returns (results DataFrame with equity curve, trades list).
+    Each trade dict carries 'leg' = 'CE' or 'PE'.
+    """
+    import datetime as _dt
+
+    # Align CE / PE prices onto main df timestamp
+    def _align(opt_raw: pd.DataFrame, name: str) -> pd.Series:
+        if opt_raw is None or opt_raw.empty:
+            return pd.Series(np.nan, index=df.index)
+        tmp = opt_raw[["timestamp", "close"]].rename(columns={"close": name})
+        merged = pd.merge_asof(
+            df[["timestamp"]].sort_values("timestamp").reset_index(drop=False),
+            tmp.sort_values("timestamp"),
+            on="timestamp",
+            direction="nearest",
+            tolerance=pd.Timedelta("30min"),
+        ).set_index("index").sort_index()
+        return merged[name]
+
+    ce_price_s = _align(ce_df, "ce_price")
+    pe_price_s = _align(pe_df, "pe_price")
+
+    if is_intraday and eod_exit_time is not None:
+        _eod_h, _eod_m = eod_exit_time.hour, eod_exit_time.minute
+    else:
+        _eod_h, _eod_m = 15, 15
+
+    def _calc_lots(price: float) -> int:
+        if price <= 0:
+            return 0
+        if fixed_lots is not None:
+            return int(fixed_lots)
+        return max(1, int(capital * size_pct / (abs(price) * lot_size)))
+
+    cash = capital
+    equities, trades = [], []
+
+    # State:  0 = flat, 1 = CE open, -1 = PE open
+    active_leg   = 0
+    entry_price  = 0.0
+    entry_time   = None
+    n_lots       = 0
+
+    def _close_position(exit_p: float, exit_ts, reason: str) -> None:
+        nonlocal cash, active_leg, entry_price, entry_time, n_lots
+        qty  = n_lots * lot_size
+        pnl  = (exit_p - entry_price) * qty - abs(exit_p) * qty * comm_pct
+        cash += abs(entry_price) * qty + pnl
+        trades.append({
+            "leg":         "CE" if active_leg == 1 else "PE",
+            "entry_time":  entry_time,
+            "exit_time":   exit_ts,
+            "entry_price": round(entry_price, 2),
+            "exit_price":  round(exit_p, 2),
+            "qty":         qty,
+            "lots":        n_lots,
+            "pnl":         round(pnl, 2),
+            "return_pct":  round((exit_p / entry_price - 1) * 100, 2) if entry_price else 0.0,
+            "exit_reason": reason,
+        })
+        active_leg  = 0
+        entry_price = 0.0
+        entry_time  = None
+        n_lots      = 0
+
+    def _open_position(leg: int, price: float, ts):
+        nonlocal cash, active_leg, entry_price, entry_time, n_lots
+        nl   = _calc_lots(price)
+        cost = abs(price) * nl * lot_size * (1 + comm_pct)
+        if nl > 0 and cash >= cost:
+            cash        -= cost
+            active_leg   = leg
+            entry_price  = price
+            entry_time   = ts
+            n_lots       = nl
+
+    for row_i, row in df.iterrows():
+        sig = row["signal"]
+        ts  = row["timestamp"]
+        ce_p = ce_price_s.iloc[row_i] if row_i < len(ce_price_s) else np.nan
+        pe_p = pe_price_s.iloc[row_i] if row_i < len(pe_price_s) else np.nan
+
+        # ── EOD force-close ───────────────────────────────────────────────────
+        if is_intraday and active_leg != 0:
+            bar_time = ts.time() if hasattr(ts, "time") else None
+            if bar_time and bar_time >= _dt.time(_eod_h, _eod_m):
+                eod_p = ce_p if active_leg == 1 else pe_p
+                if not np.isnan(eod_p):
+                    _close_position(eod_p, ts, "EOD Square-off")
+                    equities.append(cash)
+                    continue
+
+        # ── BUY signal → target CE ────────────────────────────────────────────
+        if sig == 1:
+            if active_leg == -1 and not np.isnan(pe_p):
+                _close_position(pe_p, ts, "Close PE → Open CE")
+            if active_leg == 0 and not np.isnan(ce_p):
+                _open_position(1, ce_p, ts)
+
+        # ── SELL signal → target PE ───────────────────────────────────────────
+        elif sig == -1:
+            if active_leg == 1 and not np.isnan(ce_p):
+                _close_position(ce_p, ts, "Close CE → Open PE")
+            if active_leg == 0 and not np.isnan(pe_p):
+                _open_position(-1, pe_p, ts)
+
+        # ── Mark-to-market equity ─────────────────────────────────────────────
+        if active_leg == 1 and not np.isnan(ce_p) and ce_p > 0:
+            mtm = cash + (ce_p - entry_price) * n_lots * lot_size
+        elif active_leg == -1 and not np.isnan(pe_p) and pe_p > 0:
+            mtm = cash + (pe_p - entry_price) * n_lots * lot_size
+        else:
+            mtm = cash
+        equities.append(mtm)
+
+    # ── Force-close at last bar ────────────────────────────────────────────────
+    if active_leg != 0:
+        last_p = (float(ce_price_s.iloc[-1]) if active_leg == 1 else float(pe_price_s.iloc[-1]))
+        if not np.isnan(last_p):
+            _close_position(last_p, df["timestamp"].iloc[-1], "End of Data")
+            if equities:
+                equities[-1] = cash
+
+    while len(equities) < len(df):
+        equities.append(equities[-1] if equities else capital)
+
+    results = df[["timestamp"]].copy()
+    results["equity"]       = equities[:len(df)]
+    results["peak"]         = results["equity"].cummax()
+    results["drawdown_pct"] = (results["equity"] - results["peak"]) / results["peak"] * 100
+    return results, trades
+
+
 def metrics(results: pd.DataFrame, trades: list, capital: float) -> dict:
     import math
 
@@ -1077,17 +1236,20 @@ with st.sidebar:
 
     backtest_mode = st.radio(
         "Trade on",
-        ["Index (Futures-style)", "Options (Real Data)", "Strike Chart (ATM CE+PE)"],
+        ["Index (Futures-style)", "Options (Real Data)",
+         "Strike Chart (ATM CE+PE)", "CE/PE Alternating (Pine Script)"],
         index=0,
         help=(
             "Index mode: signals on Nifty index OHLCV.\n\n"
             "Options (Real Data): signals on index, trades real option premiums.\n\n"
-            "Strike Chart: BSP computed on ATM CE and PE candles independently. "
-            "CE signal -> CE buy trade; PE signal -> PE buy trade. OI x Volume used as BSP weight."
+            "Strike Chart: BSP computed on ATM CE and PE candles independently.\n\n"
+            "CE/PE Alternating: mirrors Pine Script exactly — BUY → open CE; "
+            "SELL → close CE + open PE; next BUY → close PE + open CE (infinite rotation)."
         )
     )
-    trade_options     = backtest_mode == "Options (Real Data)"
-    strike_chart_mode = backtest_mode == "Strike Chart (ATM CE+PE)"
+    trade_options      = backtest_mode == "Options (Real Data)"
+    strike_chart_mode  = backtest_mode == "Strike Chart (ATM CE+PE)"
+    alternating_mode   = backtest_mode == "CE/PE Alternating (Pine Script)"
 
     if strike_chart_mode:
         st.markdown('<div class="sidebar-header">📌 Strike Chart Settings</div>', unsafe_allow_html=True)
@@ -1096,6 +1258,29 @@ with st.sidebar:
         sc_lots = st.number_input("Lots per leg", min_value=1, max_value=50, value=1,
                                   help="CE leg lots and PE leg lots are independent")
         st.info("BSP on ATM CE candles -> CE BUY trade. BSP on ATM PE candles -> PE BUY trade.")
+
+    # Defaults for alternating mode variables (prevent NameError when mode not active)
+    alt_expiry_flag   = "WEEK"
+    alt_strike_offset = 0
+
+    if alternating_mode:
+        st.markdown('<div class="sidebar-header">🔁 CE/PE Alternating Settings</div>', unsafe_allow_html=True)
+        alt_expiry_flag = st.radio("Expiry Type", ["WEEK", "MONTH"], horizontal=True,
+                                   help="Weekly or Monthly expiry contract", key="alt_expiry")
+        _offset_opts   = list(range(-5, 6))
+        _offset_labels = ["ATM" if o == 0 else (f"ATM+{o}" if o > 0 else f"ATM{o}") for o in _offset_opts]
+        alt_strike_lbl = st.select_slider(
+            "Strike (CE & PE)", options=_offset_labels, value="ATM",
+            help="Both CE and PE legs use the same offset from ATM"
+        )
+        alt_strike_offset = _offset_opts[_offset_labels.index(alt_strike_lbl)]
+        st.info(
+            "\U0001F4CC **State Machine (Pine Script exact):**\n\n"
+            "\U0001F7E2 **BUY signal** \u2192 Open CE (buy call)\n\n"
+            "\U0001F534 **SELL signal** \u2192 Close CE \u2192 Open PE (buy put)\n\n"
+            "\U0001F7E2 **Next BUY** \u2192 Close PE \u2192 Open CE\n\n"
+            "\u2026repeats indefinitely"
+        )
 
     if trade_options:
         st.markdown('<div class="sidebar-header">📌 Option Legs (Spread / Hedge)</div>', unsafe_allow_html=True)
@@ -1264,6 +1449,358 @@ st.divider()
 # ══════════════════════════════════════════════════════════════════════════════
 
 if run_btn:
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CE/PE ALTERNATING MODE — mirrors Pine Script state machine
+    # ══════════════════════════════════════════════════════════════════════════
+    if alternating_mode:
+        fetch_interval = interval if interval != "D" else "25"
+        fd = from_date.strftime("%Y-%m-%d")
+        td = to_date.strftime("%Y-%m-%d")
+
+        # ── 1. Fetch index OHLCV for signals ──────────────────────────────────
+        with st.spinner(f"📡 Fetching {index_name} index data for signals…"):
+            df = _fetcher.fetch_index_ohlcv(
+                idx_cfg["security_id"],
+                fd, td, interval,
+                debug=debug_mode
+            )
+        if df is None or df.empty:
+            st.error("❌ No index data. Check token / date range.")
+            st.stop()
+
+        # Compute indicators + signals on index
+        df["ema20"]   = ema(df["close"], 20)
+        df["ema50"]   = ema(df["close"], 50)
+        df["ema100"]  = ema(df["close"], 100)
+        df["ema200"]  = ema(df["close"], 200)
+        df["vol_sma"] = df["volume"].rolling(vol_period).mean()
+
+        if use_daily_bsp and interval != "D":
+            with st.spinner("📅 Fetching daily bars for BSP…"):
+                daily_df = _fetcher.fetch_index_ohlcv(
+                    idx_cfg["security_id"], fd, td, interval="D", debug=False)
+            df["bsp"] = calc_bsp_daily(df, daily_df, bsp_length)
+        else:
+            df["bsp"] = calc_bsp(df, bsp_length)
+
+        df = generate_signals(df, bsp_buy_lvl, bsp_sell_lvl,
+                              ema_filter=ema_filter, signal_mode=signal_mode)
+
+        n_buy  = int((df["signal"] == 1).sum())
+        n_sell = int((df["signal"] == -1).sum())
+        st.success(f"✅ Index: **{len(df):,} bars** | Buy signals: **{n_buy}** | Sell signals: **{n_sell}**")
+
+        # ── 2. Fetch ATM CE option data ────────────────────────────────────────
+        with st.spinner(f"📡 Fetching {index_name} ATM{'+'+str(alt_strike_offset) if alt_strike_offset > 0 else ('-'+str(abs(alt_strike_offset)) if alt_strike_offset < 0 else '')} CE…"):
+            ce_raw = _fetcher.fetch_rolling_option(
+                idx_cfg["security_id"], alt_strike_offset, "CALL",
+                fd, td, interval=fetch_interval,
+                expiry_flag=alt_expiry_flag, debug=debug_mode
+            )
+
+        # ── 3. Fetch ATM PE option data ────────────────────────────────────────
+        with st.spinner(f"📡 Fetching {index_name} ATM{'+'+str(alt_strike_offset) if alt_strike_offset > 0 else ('-'+str(abs(alt_strike_offset)) if alt_strike_offset < 0 else '')} PE…"):
+            pe_raw = _fetcher.fetch_rolling_option(
+                idx_cfg["security_id"], alt_strike_offset, "PUT",
+                fd, td, interval=fetch_interval,
+                expiry_flag=alt_expiry_flag, debug=debug_mode
+            )
+
+        # Fallback to Black-Scholes simulation if API returns nothing
+        if ce_raw is None or ce_raw.empty:
+            st.warning("⚠️ No CE data — using Black-Scholes simulation.")
+            ce_raw = simulate_option_prices(df, alt_strike_offset, strike_gap, "CALL", 7, 0.15)
+            ce_raw = ce_raw.rename(columns={"opt_price": "close"})[["timestamp", "close"]]
+        if pe_raw is None or pe_raw.empty:
+            st.warning("⚠️ No PE data — using Black-Scholes simulation.")
+            pe_raw = simulate_option_prices(df, alt_strike_offset, strike_gap, "PUT", 7, 0.15)
+            pe_raw = pe_raw.rename(columns={"opt_price": "close"})[["timestamp", "close"]]
+
+        st.success(f"✅ CE: **{len(ce_raw):,} bars** | PE: **{len(pe_raw):,} bars**")
+
+        # ── 4. Run alternating backtest ────────────────────────────────────────
+        with st.spinner("📊 Running CE/PE alternating backtest…"):
+            results, trades = run_backtest_alternating(
+                df, ce_raw, pe_raw,
+                capital=init_capital,
+                size_pct=pos_size_pct / 100,
+                comm_pct=comm_pct / 100,
+                lot_size=lot_size,
+                fixed_lots=fixed_lots,
+                is_intraday=is_intraday,
+                eod_exit_time=eod_exit_time,
+            )
+            m = metrics(results, trades, init_capital)
+
+        # ── 5. Mode banner ────────────────────────────────────────────────────
+        _strike_tag = ("ATM" if alt_strike_offset == 0 else
+                       f"ATM+{alt_strike_offset}" if alt_strike_offset > 0 else f"ATM{alt_strike_offset}")
+        st.info(
+            f"🔁 **CE/PE Alternating Mode** · {index_name} · {_strike_tag} · "
+            f"{interval_lbl} · {alt_expiry_flag} expiry · "
+            f"{'MIS' if is_intraday else 'NRML'}"
+        )
+
+        # ── 6. KPI row ────────────────────────────────────────────────────────
+        k = st.columns(7)
+        k[0].metric("Net P&L",        f"₹{m['total_pnl']:,.0f}")
+        k[1].metric("Total Return",   f"{m['total_return']:.1f}%")
+        k[2].metric("CAGR",           f"{m['cagr']:.1f}%")
+        k[3].metric("Win Rate",       f"{m['win_rate']:.1f}%")
+        k[4].metric("Profit Factor",  f"{m['profit_factor']:.2f}")
+        k[5].metric("Max Drawdown",   f"{m['max_drawdown']:.1f}%")
+        k[6].metric("Sharpe",         f"{m['sharpe']:.2f}")
+
+        # ── 7. CE / PE trade split ────────────────────────────────────────────
+        ce_trades = [t for t in trades if t.get("leg") == "CE"]
+        pe_trades = [t for t in trades if t.get("leg") == "PE"]
+        col_ce, col_pe = st.columns(2)
+        with col_ce:
+            st.markdown("#### 📈 CE (Call) Trades")
+            st.metric("Count", len(ce_trades))
+            if ce_trades:
+                ce_pnl  = sum(t["pnl"] for t in ce_trades)
+                ce_wins = sum(1 for t in ce_trades if t["pnl"] > 0)
+                st.metric("Total P&L", f"₹{ce_pnl:,.2f}")
+                st.metric("Win Rate",  f"{ce_wins/len(ce_trades)*100:.1f}%")
+        with col_pe:
+            st.markdown("#### 📉 PE (Put) Trades")
+            st.metric("Count", len(pe_trades))
+            if pe_trades:
+                pe_pnl  = sum(t["pnl"] for t in pe_trades)
+                pe_wins = sum(1 for t in pe_trades if t["pnl"] > 0)
+                st.metric("Total P&L", f"₹{pe_pnl:,.2f}")
+                st.metric("Win Rate",  f"{pe_wins/len(pe_trades)*100:.1f}%")
+
+        st.divider()
+
+        # ── 8. Tabs ───────────────────────────────────────────────────────────
+        atab1, atab2, atab3, atab4 = st.tabs(["📈 Chart", "📋 Trades", "📉 Equity & DD", "📑 Stats"])
+
+        with atab1:
+            # Main price chart with signals
+            ph_a   = pivot_highs(df, pivot_length)
+            pl_a   = pivot_lows(df, pivot_length)
+            obs_a  = order_blocks(df, ph_a, pl_a, vol_threshold)
+            fvgs_a = fair_value_gaps(df)
+
+            fig_a = make_subplots(
+                rows=3, cols=1, shared_xaxes=True,
+                row_heights=[0.55, 0.20, 0.25], vertical_spacing=0.025,
+                subplot_titles=("Price + SMC Levels", "Volume", "BSP Oscillator")
+            )
+            fig_a.add_trace(go.Candlestick(
+                x=df["timestamp"], open=df["open"], high=df["high"],
+                low=df["low"], close=df["close"], name=index_name,
+                increasing_line_color="#00d4aa", decreasing_line_color="#ff4b6e"
+            ), row=1, col=1)
+
+            for show, col, name, color in [
+                (show_e20,  "ema20",  "EMA 20",  "#ff4b6e"),
+                (show_e50,  "ema50",  "EMA 50",  "#ff9900"),
+                (show_e100, "ema100", "EMA 100", "#00bcd4"),
+                (show_e200, "ema200", "EMA 200", "#3f8ef5"),
+            ]:
+                if show:
+                    fig_a.add_trace(go.Scatter(x=df["timestamp"], y=df[col], name=name,
+                                               line=dict(color=color, width=1)), row=1, col=1)
+
+            for ob in obs_a[:60]:
+                fc = "rgba(255,75,110,0.10)" if ob["type"]=="bearish" else "rgba(0,212,170,0.10)"
+                bc = "#ff4b6e" if ob["type"]=="bearish" else "#00d4aa"
+                x0 = df["timestamp"].iloc[ob["start"]]
+                x1 = df["timestamp"].iloc[min(ob["end"], len(df)-1)]
+                fig_a.add_hrect(y0=ob["btm"], y1=ob["top"], x0=x0, x1=x1,
+                                fillcolor=fc, line_color=bc, line_width=0.5,
+                                annotation_text="OB★" if ob["strong"] else "OB",
+                                annotation_font_color=bc, annotation_font_size=8,
+                                row=1, col=1)
+
+            for fvg in fvgs_a[:40]:
+                x0 = df["timestamp"].iloc[fvg["start"]]
+                x1 = df["timestamp"].iloc[min(fvg["start"]+15, len(df)-1)]
+                fig_a.add_hrect(y0=fvg["btm"], y1=fvg["top"], x0=x0, x1=x1,
+                                fillcolor="rgba(150,0,255,0.09)", line_color="#9000ff", line_width=0.5,
+                                annotation_text="FVG", annotation_font_color="#b060ff",
+                                annotation_font_size=8, row=1, col=1)
+
+            # Signal markers — colour by CE/PE direction
+            buys_a  = df[df["signal"] ==  1]
+            sells_a = df[df["signal"] == -1]
+            fig_a.add_trace(go.Scatter(
+                x=buys_a["timestamp"], y=buys_a["low"] * 0.998,
+                mode="markers", name="BUY → CE",
+                marker=dict(symbol="triangle-up", size=10, color="#00d4aa",
+                            line=dict(color="#fff", width=1))
+            ), row=1, col=1)
+            fig_a.add_trace(go.Scatter(
+                x=sells_a["timestamp"], y=sells_a["high"] * 1.002,
+                mode="markers", name="SELL → PE",
+                marker=dict(symbol="triangle-down", size=10, color="#ff4b6e",
+                            line=dict(color="#fff", width=1))
+            ), row=1, col=1)
+
+            # Volume
+            vcol = ["#00d4aa" if c >= o else "#ff4b6e" for c, o in zip(df["close"], df["open"])]
+            fig_a.add_trace(go.Bar(x=df["timestamp"], y=df["volume"],
+                                   name="Volume", marker_color=vcol, opacity=0.6), row=2, col=1)
+            fig_a.add_trace(go.Scatter(x=df["timestamp"], y=df["vol_sma"],
+                                       name="Vol SMA", line=dict(color="#ff9900", width=1)), row=2, col=1)
+
+            # BSP
+            bsp_col_a = ["#00d4aa" if v > 0 else "#ff4b6e" for v in df["bsp"].fillna(0)]
+            fig_a.add_trace(go.Bar(x=df["timestamp"], y=df["bsp"],
+                                   name="BSP", marker_color=bsp_col_a, opacity=0.85), row=3, col=1)
+            fig_a.add_hline(y=bsp_buy_lvl,  line_color="#00d4aa", line_dash="dash", line_width=1, row=3, col=1)
+            fig_a.add_hline(y=bsp_sell_lvl, line_color="#ff4b6e", line_dash="dash", line_width=1, row=3, col=1)
+            fig_a.add_hline(y=0,            line_color="#444",    line_width=1,      row=3, col=1)
+
+            fig_a.update_layout(
+                height=850, template="plotly_dark", showlegend=True,
+                xaxis_rangeslider_visible=False,
+                paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                margin=dict(t=35, b=20)
+            )
+            fig_a.update_xaxes(showgrid=True, gridcolor="#1e2130")
+            fig_a.update_yaxes(showgrid=True, gridcolor="#1e2130")
+            st.plotly_chart(fig_a, use_container_width=True)
+
+        with atab2:
+            st.markdown("#### Trade Log — CE/PE Alternating")
+            if trades:
+                tdf_a = pd.DataFrame(trades)
+                tdf_a["cum_pnl"] = tdf_a["pnl"].cumsum().round(2)
+                for col in ["entry_price","exit_price","pnl","return_pct","cum_pnl"]:
+                    if col in tdf_a.columns:
+                        tdf_a[col] = tdf_a[col].round(2)
+
+                rename_a = {
+                    "leg": "Leg", "entry_time": "Entry", "exit_time": "Exit",
+                    "entry_price": "Entry ₹", "exit_price": "Exit ₹",
+                    "qty": "Qty", "lots": "Lots", "pnl": "P&L ₹",
+                    "cum_pnl": "Cum. P&L ₹", "return_pct": "Return %",
+                    "exit_reason": "Reason"
+                }
+                display_a = tdf_a[[c for c in rename_a if c in tdf_a.columns]].rename(columns=rename_a)
+                float_cols_a = display_a.select_dtypes(include="number").columns.tolist()
+                fmt_a = {c: "{:.2f}" for c in float_cols_a}
+                color_cols_a = [c for c in ["P&L ₹", "Cum. P&L ₹", "Return %"] if c in display_a.columns]
+
+                def _leg_bg(row):
+                    styles = [""] * len(row)
+                    if "Leg" in row.index:
+                        leg_idx = list(row.index).index("Leg")
+                        if row["Leg"] == "CE":
+                            styles[leg_idx] = "background-color:rgba(0,212,170,0.15)"
+                        elif row["Leg"] == "PE":
+                            styles[leg_idx] = "background-color:rgba(255,75,110,0.15)"
+                    return styles
+
+                styled_a = (display_a.style
+                    .format(fmt_a)
+                    .apply(_leg_bg, axis=1)
+                    .applymap(
+                        lambda v: ("color:#00d4aa" if isinstance(v,(int,float)) and v > 0
+                                   else "color:#ff4b6e" if isinstance(v,(int,float)) and v < 0 else ""),
+                        subset=color_cols_a
+                    ))
+                st.dataframe(styled_a, use_container_width=True, height=500)
+
+                c1_a, c2_a, c3_a, c4_a = st.columns(4)
+                c1_a.metric("Net P&L",    f"₹{tdf_a['pnl'].sum():,.2f}")
+                c2_a.metric("Trades",     len(tdf_a))
+                c3_a.metric("Avg/Trade",  f"₹{tdf_a['pnl'].mean():,.2f}")
+                c4_a.metric("Best Trade", f"₹{tdf_a['pnl'].max():,.2f}")
+
+                csv_a = tdf_a.to_csv(index=False).encode()
+                st.download_button("⬇️ Download CSV", csv_a,
+                                   f"{index_name}_alternating_trades.csv", "text/csv")
+            else:
+                st.info("No trades generated. Try loosening BSP levels or switching Signal Mode.")
+
+        with atab3:
+            fig_eq_a = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                     row_heights=[0.65, 0.35], vertical_spacing=0.05,
+                                     subplot_titles=("Equity Curve (₹)", "Drawdown (%)"))
+            fig_eq_a.add_trace(go.Scatter(
+                x=results["timestamp"], y=results["equity"],
+                name="Portfolio", fill="tozeroy",
+                line=dict(color="#00d4aa", width=2),
+                fillcolor="rgba(0,212,170,0.08)"
+            ), row=1, col=1)
+            fig_eq_a.add_hline(y=init_capital, line_color="#555", line_dash="dash", row=1, col=1)
+            fig_eq_a.add_trace(go.Scatter(
+                x=results["timestamp"], y=results["drawdown_pct"],
+                name="Drawdown", fill="tozeroy",
+                line=dict(color="#ff4b6e", width=1),
+                fillcolor="rgba(255,75,110,0.12)"
+            ), row=2, col=1)
+
+            # Shade CE trades green, PE trades red on equity curve
+            if trades:
+                for t in trades:
+                    if pd.notna(t.get("entry_time")) and pd.notna(t.get("exit_time")):
+                        fc = "rgba(0,212,170,0.05)" if t.get("leg") == "CE" else "rgba(255,75,110,0.05)"
+                        fig_eq_a.add_vrect(x0=t["entry_time"], x1=t["exit_time"],
+                                           fillcolor=fc, line_width=0, row=1, col=1)
+
+            fig_eq_a.update_layout(
+                height=500, template="plotly_dark",
+                paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                margin=dict(t=35, b=20)
+            )
+            fig_eq_a.update_xaxes(showgrid=True, gridcolor="#1e2130")
+            fig_eq_a.update_yaxes(showgrid=True, gridcolor="#1e2130")
+            st.plotly_chart(fig_eq_a, use_container_width=True)
+
+        with atab4:
+            c1_s, c2_s = st.columns(2)
+            with c1_s:
+                st.markdown("**Return Metrics**")
+                for k2, v in [
+                    ("Total Return (%)",  f"{m['total_return']:.2f}%"),
+                    ("Total P&L (₹)",     f"₹{m['total_pnl']:,.2f}"),
+                    ("CAGR (%)",          f"{m['cagr']:.2f}%"),
+                    ("Sharpe Ratio",      f"{m['sharpe']:.3f}"),
+                    ("Sortino Ratio",     f"{m['sortino']:.3f}"),
+                    ("Calmar Ratio",      f"{m['calmar']:.3f}"),
+                ]:
+                    st.markdown(f"`{k2}` &nbsp; **{v}**")
+            with c2_s:
+                st.markdown("**Trade Metrics**")
+                for k2, v in [
+                    ("Total Trades",     m["total_trades"]),
+                    ("Win Rate (%)",     f"{m['win_rate']:.1f}%"),
+                    ("Profit Factor",    f"{m['profit_factor']:.3f}"),
+                    ("Avg Win (₹)",      f"₹{m['avg_win']:,.2f}"),
+                    ("Avg Loss (₹)",     f"₹{m['avg_loss']:,.2f}"),
+                    ("Max Drawdown (%)", f"{m['max_drawdown']:.2f}%"),
+                ]:
+                    st.markdown(f"`{k2}` &nbsp; **{v}**")
+
+            if len(results) > 30:
+                st.markdown("#### Monthly Returns")
+                r2_a = results.copy()
+                r2_a["month"]  = r2_a["timestamp"].dt.to_period("M")
+                monthly_a = r2_a.groupby("month")["equity"].last().pct_change() * 100
+                monthly_a.index = monthly_a.index.astype(str)
+                monthly_a = monthly_a.dropna()
+                fig_m_a = go.Figure(go.Bar(
+                    x=monthly_a.index, y=monthly_a.values,
+                    marker_color=["#00d4aa" if v >= 0 else "#ff4b6e" for v in monthly_a.values],
+                    text=[f"{v:.1f}%" for v in monthly_a.values], textposition="outside",
+                    textfont=dict(size=9)
+                ))
+                fig_m_a.update_layout(
+                    height=280, template="plotly_dark",
+                    paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                    xaxis=dict(tickangle=-45), margin=dict(t=10, b=50),
+                    yaxis_title="Return (%)"
+                )
+                st.plotly_chart(fig_m_a, use_container_width=True)
+
+        st.stop()  # Don't run standard pipeline
 
     # ══════════════════════════════════════════════════════════════════════════
     # STRIKE CHART MODE — BSP on ATM CE and PE candles independently
