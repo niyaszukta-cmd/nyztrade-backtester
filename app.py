@@ -1,7 +1,6 @@
 """
 NYZTrade SMC Liquidity Lens Backtester
 Index Options Backtest | Dhan API | Built for NIYAS
-Forensic-fixed v4 — 100% aligned with TradingView Pine Script signal logic
 """
 
 import streamlit as st
@@ -45,21 +44,12 @@ st.markdown("""
         background: #1a1d29; border-radius: 6px; border: 1px solid #2d3139;
     }
     .stTabs [aria-selected="true"] { background: #0052cc; }
-    .pine-badge {
-        background: rgba(0,212,170,0.10); border: 1px solid rgba(0,212,170,0.30);
-        border-radius: 6px; padding: 6px 12px; font-size: 0.78rem;
-        color: #00d4aa; margin-bottom: 6px; display: inline-block;
-    }
-    .diff-box {
-        background: #1a1d29; border-left: 3px solid #f5a623;
-        border-radius: 4px; padding: 8px 12px; font-size: 0.8rem;
-        color: #ccc; margin: 4px 0;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DHAN CONFIG
+# DHAN CONFIG — identical pattern to GEX Dashboard
+# Update access_token daily. client_id never changes.
 # ══════════════════════════════════════════════════════════════════════════════
 
 from dataclasses import dataclass
@@ -82,12 +72,14 @@ INDICES = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DHAN FETCHER CLASS
+# DHAN FETCHER CLASS — mirrors GEX Dashboard's UnifiedOptionsFetcher exactly
+# No token passed anywhere. self.headers used on every request.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DhanFetcher:
     def __init__(self, config: DhanConfig):
         self.config = config
+        # Identical header structure to GEX Dashboard
         self.headers = {
             "access-token": config.access_token,
             "client-id":    config.client_id,
@@ -109,9 +101,27 @@ class DhanFetcher:
     def fetch_index_ohlcv(self, security_id: int, from_date: str,
                            to_date: str, interval: str,
                            debug: bool = False) -> pd.DataFrame | None:
+        """
+        Fetch index OHLCV — same approach as GEX dashboard fetch_rolling_data.
+
+        Intraday (1/5/15/25/60):  POST /charts/intraday
+                                  exchangeSegment=IDX_I, instrument=INDEX
+                                  fromDate/toDate include time  HH:MM:SS
+
+        Daily (D):                POST /charts/historical
+                                  exchangeSegment=IDX_I, instrument=INDEX
+        """
+        # Dhan natively supports: 1, 5, 15, 25, 60
+        # 3-min and 10-min are fetched as 1-min and resampled client-side
+        RESAMPLE_MAP = {"3": ("1", 3), "10": ("1", 10)}
+        resample_to = None
+        fetch_interval = interval
+        if interval in RESAMPLE_MAP:
+            fetch_interval, resample_to = RESAMPLE_MAP[interval]
+
         intraday_set = {"1", "5", "15", "25", "60"}
 
-        if interval in intraday_set:
+        if fetch_interval in intraday_set:
             from_dt    = datetime.strptime(from_date, "%Y-%m-%d")
             to_dt      = datetime.strptime(to_date,   "%Y-%m-%d")
             total_days = max((to_dt - from_dt).days, 1)
@@ -197,6 +207,11 @@ class DhanFetcher:
                               opt_type: str, from_date: str, to_date: str,
                               interval: str = "25", expiry_flag: str = "WEEK",
                               debug: bool = False) -> pd.DataFrame | None:
+        """
+        Fetch real option OHLCV via /charts/rollingoption — chunked in 89-day windows
+        to avoid DH-905 (max 90 days per call).
+        opt_type: "CALL" or "PUT"
+        """
         strike_str = "ATM" if strike_offset == 0 else (
             f"ATM+{strike_offset}" if strike_offset > 0 else f"ATM{strike_offset}"
         )
@@ -210,7 +225,7 @@ class DhanFetcher:
         cur  = from_dt
 
         while cur <= to_dt:
-            end = min(cur + timedelta(days=89), to_dt)
+            end = min(cur + timedelta(days=89), to_dt)   # max 89 days per call (DH-905)
             payload = {
                 "exchangeSegment": "NSE_FNO",
                 "interval":        interval,
@@ -270,7 +285,7 @@ class DhanFetcher:
                   .reset_index(drop=True))
 
 
-# Module-level fetcher instance
+# Module-level fetcher instance — uses hardcoded DhanConfig
 _fetcher = DhanFetcher(DhanConfig())
 
 
@@ -294,15 +309,20 @@ def _parse_ohlcv(data: dict) -> pd.DataFrame | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_atm_strike(spot: float, strike_gap: int) -> int:
+    """Round spot to nearest strike_gap."""
     return int(round(spot / strike_gap) * strike_gap)
 
+
 def get_strike_label(offset: int) -> str:
-    if offset == 0:  return "ATM"
-    if offset > 0:   return f"ATM+{offset}"
+    if offset == 0:   return "ATM"
+    if offset > 0:    return f"ATM+{offset}"
     return f"ATM{offset}"
 
+
 def compute_strike_price(spot: float, strike_gap: int, offset: int) -> int:
-    return get_atm_strike(spot, strike_gap) + offset * strike_gap
+    """ATM + offset * strike_gap."""
+    atm = get_atm_strike(spot, strike_gap)
+    return atm + offset * strike_gap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -313,70 +333,67 @@ def ema(s: pd.Series, p: int) -> pd.Series:
     return s.ewm(span=p, adjust=False).mean()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX 1: BSP — exact Pine Script formula (flat candle → ad = 0, not NaN)
-#
-# Pine:  ad = close==high and close==low or high==low ? 0
-#               : ((2*close-low-high)/(high-low)) * volume
-#        mf = sum(ad, bspLength) / sum(volume, bspLength)
-# ─────────────────────────────────────────────────────────────────────────────
 def calc_bsp(df: pd.DataFrame, length: int) -> pd.Series:
     """
-    BSP on CURRENT timeframe bars.
-    Exact Pine Script formula — flat candle (high==low) → ad = 0 (not NaN).
+    BSP (Balance of Selling Pressure) — exact Pine Script translation.
+    Pine: ad = (close==high and close==low) or high==low ? 0 : ((2*close-low-high)/(high-low))*volume
+    mf  = sum(ad, length) / sum(volume, length)
     """
-    hl   = df["high"] - df["low"]
+    hl = df["high"] - df["low"]
     flat = (hl == 0) | ((df["close"] == df["high"]) & (df["close"] == df["low"]))
-    ad   = np.where(
-        flat,
-        0.0,
-        ((2 * df["close"] - df["low"] - df["high"]) / hl.replace(0, 1.0)) * df["volume"]
-    )
-    ad  = pd.Series(ad, index=df.index)
+    ad   = np.where(flat, 0.0, ((2 * df["close"] - df["low"] - df["high"]) / hl.replace(0, 1.0)) * df["volume"])
+    ad   = pd.Series(ad, index=df.index)
     vol_sum = df["volume"].rolling(length).sum()
     return (ad.rolling(length).sum() / vol_sum).fillna(0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX 2: Daily-timeframe BSP (Pine Default)
-#
-# Pine:  bsp = request.security(syminfo.tickerid, timeframe, mf)
-#        where timeframe default = "D"
-#
-# This means: even on a 5-min chart, BSP is computed on DAILY bars.
-# Each intraday bar gets the DAILY BSP value for that date stamped onto it.
-# This function replicates that behaviour exactly.
-# ─────────────────────────────────────────────────────────────────────────────
+def calc_bsp_oiv(df: pd.DataFrame, length: int) -> pd.Series:
+    """
+    BSP variant for option strike charts — uses OI × Volume as the weight
+    instead of plain volume. This amplifies commitment signal:
+    high OI + high volume = smart money repositioning.
+
+    Formula: ad = ((2*close - low - high) / (high - low)) * (oi * volume)
+             bsp = sum(ad, length) / sum(oi*volume, length)
+
+    Falls back to plain volume if OI column is missing or all-NaN.
+    """
+    if "oi" not in df.columns or df["oi"].isna().all():
+        return calc_bsp(df, length)  # fallback
+
+    oi_vol = (df["oi"].fillna(0) * df["volume"].fillna(0))
+    hl   = df["high"] - df["low"]
+    flat = (hl == 0) | ((df["close"] == df["high"]) & (df["close"] == df["low"]))
+    ad   = np.where(flat, 0.0,
+                    ((2 * df["close"] - df["low"] - df["high"]) / hl.replace(0, 1.0)) * oi_vol)
+    ad      = pd.Series(ad, index=df.index)
+    oiv_sum = oi_vol.rolling(length).sum()
+    return (ad.rolling(length).sum() / oiv_sum.replace(0, np.nan)).fillna(0)
+
+
 def calc_bsp_daily(df_intraday: pd.DataFrame, daily_df: pd.DataFrame, length: int) -> pd.Series:
     """
-    Compute BSP on daily bars, then forward-fill onto each intraday bar by date.
-    Matches Pine's: bsp = request.security(syminfo.tickerid, 'D', mf)
-    Falls back to intraday BSP if daily_df is None/empty.
+    Pine uses request.security(syminfo.tickerid, 'D', mf) — BSP is computed on
+    DAILY bars and then stamp-forwarded onto each intraday bar (same value all day).
+    This function replicates that: compute BSP on daily_df, then merge onto intraday.
     """
     if daily_df is None or daily_df.empty:
-        return calc_bsp(df_intraday, length)
-
-    # Compute BSP on daily bars using exact Pine formula
-    hl   = daily_df["high"] - daily_df["low"]
+        return calc_bsp(df_intraday, length)  # fallback to intraday BSP
+    # Compute on daily bars
+    hl = daily_df["high"] - daily_df["low"]
     flat = (hl == 0) | ((daily_df["close"] == daily_df["high"]) & (daily_df["close"] == daily_df["low"]))
-    ad   = np.where(
-        flat,
-        0.0,
-        ((2 * daily_df["close"] - daily_df["low"] - daily_df["high"])
-         / hl.replace(0, 1.0)) * daily_df["volume"]
-    )
-    ad      = pd.Series(ad, index=daily_df.index)
+    ad   = np.where(flat, 0.0,
+                    ((2 * daily_df["close"] - daily_df["low"] - daily_df["high"])
+                     / hl.replace(0, 1.0)) * daily_df["volume"])
+    ad   = pd.Series(ad, index=daily_df.index)
     vol_sum = daily_df["volume"].rolling(length).sum()
-    daily_bsp_vals = (ad.rolling(length).sum() / vol_sum).fillna(0)
-
-    # Map date → daily BSP value
-    daily_dates = pd.to_datetime(daily_df["timestamp"].values).normalize()
-    date_to_bsp = dict(zip(daily_dates, daily_bsp_vals.values))
-
-    # Stamp onto each intraday bar by normalised date
+    daily_bsp = (ad.rolling(length).sum() / vol_sum).fillna(0)
+    daily_bsp.index = pd.to_datetime(daily_df["timestamp"].values).normalize()
+    # Stamp onto intraday bars by date
     intra_dates = pd.to_datetime(df_intraday["timestamp"].values).normalize()
-    result = pd.Series(intra_dates, index=df_intraday.index).map(date_to_bsp)
-    return result.ffill().fillna(0)
+    return pd.Series(intra_dates, index=df_intraday.index).map(
+        daily_bsp.to_dict()
+    ).ffill().fillna(0)
 
 
 def pivot_highs(df: pd.DataFrame, n: int) -> list[dict]:
@@ -401,7 +418,8 @@ def pivot_lows(df: pd.DataFrame, n: int) -> list[dict]:
     return out
 
 
-def order_blocks(df: pd.DataFrame, ph: list, pl: list, vt: float = 1.5) -> list[dict]:
+def order_blocks(df: pd.DataFrame, ph: list, pl: list,
+                 vt: float = 1.5) -> list[dict]:
     vsma = df["volume"].rolling(14).mean()
     obs  = []
     for p in ph:
@@ -440,15 +458,17 @@ def fair_value_gaps(df: pd.DataFrame) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OPTION PRICING (Black-Scholes fallback)
+# OPTION BACKTEST ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _norm_cdf(x: float) -> float:
+    """Normal CDF using math.erf — no scipy needed."""
     import math
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
 
 def black_scholes_price(S, K, T, r, sigma, option_type="CE"):
+    """Black-Scholes using pure math — no scipy."""
     import math
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         intrinsic = max(S - K, 0) if option_type in ("CE", "CALL") else max(K - S, 0)
@@ -467,9 +487,14 @@ def black_scholes_price(S, K, T, r, sigma, option_type="CE"):
 def simulate_option_prices(df: pd.DataFrame, strike_offset: int,
                             strike_gap: int, opt_type: str,
                             dte: int = 7, iv: float = 0.15) -> pd.DataFrame:
+    """
+    Simulate option prices for each bar using Black-Scholes.
+    strike_offset: integer offset from ATM (e.g. 0=ATM, 1=ATM+1, -1=ATM-1)
+    """
     df = df.copy()
-    r  = 0.065
+    r  = 0.065  # RBI repo rate approx
     prices = []
+
     for i, row in df.iterrows():
         S = row["close"]
         remaining_dte = max(dte - i * (dte / len(df)), 0.01)
@@ -477,60 +502,35 @@ def simulate_option_prices(df: pd.DataFrame, strike_offset: int,
         K = compute_strike_price(S, strike_gap, strike_offset)
         price = black_scholes_price(S, K, T, r, iv, opt_type)
         prices.append({"strike": K, "opt_price": round(price, 2)})
+
     opt_df = pd.DataFrame(prices, index=df.index)
     df["strike"]    = opt_df["strike"]
     df["opt_price"] = opt_df["opt_price"]
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FIX 3 + FIX 4: SIGNAL GENERATION — exact Pine Script logic
-#
-# Pine Script strategy logic:
-#   longCondition  = bsp > bspBuyLevel  AND close > ema20 AND ema20 > ema50
-#   shortCondition = bsp < bspSellLevel AND close < ema20 AND ema20 < ema50
-#
-#   strategy.entry("BUY", strategy.long) when longCondition  ← LONG only
-#   strategy.close("BUY")               when shortCondition  ← exit long only
-#
-# KEY FINDINGS:
-#   Fix 3 — "Pine Exact" mode: entry = bsp > level (sustained, NOT cross)
-#            exit = bsp < sellLevel AND bear EMA (NOT just bsp < 0)
-#   Fix 4 — Pine only takes LONG positions and CLOSES them on shortCondition.
-#            No short entries. signal=-1 in Python = EXIT only.
-# ══════════════════════════════════════════════════════════════════════════════
 def generate_signals(df: pd.DataFrame, buy_lvl: float, sell_lvl: float,
-                      ema_filter: bool = True,
-                      signal_mode: str = "Pine Exact") -> pd.DataFrame:
+                      ema_filter: bool = True, signal_mode: str = "Pine Exact") -> pd.DataFrame:
     """
-    Signal generation — four modes:
+    Signal modes:
 
-    ┌──────────────┬──────────────────────────────────────────────────────────┐
-    │ Pine Exact   │ 100% matches TradingView Pine Script (DEFAULT)           │
-    │  (default)   │ ENTRY: bsp > buyLvl AND close>ema20 AND ema20>ema50     │
-    │              │ EXIT:  bsp < sellLvl AND close<ema20 AND ema20<ema50    │
-    │              │ Only LONG trades — identical to strategy.entry/close BUY │
-    ├──────────────┼──────────────────────────────────────────────────────────┤
-    │ Level Hold   │ Entry while BSP > buyLvl (sustained); exit when BSP     │
-    │              │ returns to neutral zone (bsp < 0). More trades on long  │
-    │              │ historical data but slightly deviates from Pine.         │
-    ├──────────────┼──────────────────────────────────────────────────────────┤
-    │ Flip         │ Trade only on level CROSS (fewest signals). May miss     │
-    │              │ trades on long date ranges.                              │
-    ├──────────────┼──────────────────────────────────────────────────────────┤
-    │ BSP Only     │ No EMA filter, pure BSP threshold. Most signals.         │
-    │              │ Useful for long-period backtests where EMA filter is     │
-    │              │ too restrictive.                                         │
-    └──────────────┴──────────────────────────────────────────────────────────┘
+    Pine Exact  ← DEFAULT — exact replica of TradingView Pine Script logic:
+                  ENTRY: bsp > buyLevel AND close > ema20 AND ema20 > ema50
+                  EXIT:  bsp < sellLevel AND close < ema20 AND ema20 < ema50
+                  (strategy.entry BUY + strategy.close BUY — no shorts taken)
 
-    Returns df with "signal" column: 1 = BUY/enter long, -1 = EXIT long, 0 = hold.
-    NOTE: signal=-1 is always EXIT only (no short entries), matching Pine exactly.
+    Level Hold  — entry while BSP sustained above level; exit at neutral BSP
+                  (more trades on long historical data)
+
+    Flip        — entry only on BSP level CROSS; exit only on cross below sell level
+
+    BSP Only    — no EMA filter, pure BSP threshold (most trades)
     """
     df = df.copy()
 
-    # EMA trend filters — same formula as Pine ta.ema (ewm span, adjust=False)
+    # EMA trend conditions — shared by all modes
     has_ema = "ema20" in df.columns and "ema50" in df.columns
-    if has_ema and ema_filter and signal_mode != "BSP Only":
+    if has_ema and ema_filter:
         bull_trend = (df["close"] > df["ema20"]) & (df["ema20"] > df["ema50"])
         bear_trend = (df["close"] < df["ema20"]) & (df["ema20"] < df["ema50"])
     else:
@@ -539,20 +539,21 @@ def generate_signals(df: pd.DataFrame, buy_lvl: float, sell_lvl: float,
 
     bsp = df["bsp"]
 
-    # ── Pine Exact (default) ─────────────────────────────────────────────────
     if signal_mode == "Pine Exact":
+        # ── EXACT Pine Script replication ────────────────────────────────────
         # longCondition  = bsp > bspBuyLevel  AND close > ema20 AND ema20 > ema50
         # shortCondition = bsp < bspSellLevel AND close < ema20 AND ema20 < ema50
-        long_entry  = (bsp > buy_lvl)   & bull_trend
-        exit_signal = (bsp < sell_lvl)  & bear_trend
+        # strategy.entry("BUY", strategy.long) when longCondition
+        # strategy.close("BUY")               when shortCondition
+        long_entry  = (bsp > buy_lvl)  & bull_trend
+        exit_signal = (bsp < sell_lvl) & bear_trend
         df["signal"] = np.where(long_entry, 1, np.where(exit_signal, -1, 0))
         return df
 
-    # ── Level Hold ───────────────────────────────────────────────────────────
     elif signal_mode == "Level Hold":
         long_entry  = (bsp > buy_lvl)  & bull_trend
         short_entry = (bsp < sell_lvl) & bear_trend
-        long_exit   = bsp < 0          # exit when BSP neutral
+        long_exit   = bsp < 0
         short_exit  = bsp > 0
         sigs = [0] * len(df)
         for i in range(1, len(df)):
@@ -570,13 +571,11 @@ def generate_signals(df: pd.DataFrame, buy_lvl: float, sell_lvl: float,
         df["signal"] = sigs
         return df
 
-    # ── BSP Only ─────────────────────────────────────────────────────────────
     elif signal_mode == "BSP Only":
         long_entry  = bsp > buy_lvl
         short_entry = bsp < sell_lvl
 
-    # ── Flip (level cross) ───────────────────────────────────────────────────
-    else:
+    else:  # Flip — BSP level cross
         long_entry  = (bsp > buy_lvl)  & (bsp.shift(1) <= buy_lvl)  & bull_trend
         short_entry = (bsp < sell_lvl) & (bsp.shift(1) >= sell_lvl) & bear_trend
 
@@ -584,24 +583,32 @@ def generate_signals(df: pd.DataFrame, buy_lvl: float, sell_lvl: float,
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BACKTEST ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
 def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                  comm_pct: float, lot_size: int,
                  trade_options: bool = False,
                  fixed_lots: int = None,
-                 spread_legs: list = None) -> tuple[pd.DataFrame, list]:
+                 spread_legs: list = None,
+                 is_intraday: bool = False,
+                 eod_exit_time=None) -> tuple[pd.DataFrame, list]:
     """
     Spread-aware lot-based backtest.
-    signal=1  → ENTER long
-    signal=-1 → EXIT long (no shorts — matches Pine strategy.close("BUY"))
+
+    Single leg:  price_col = opt_price (or close for index mode)
+    Multi-leg:   spread_price column = sum of signed leg prices already on df.
+                 Per-leg P&L breakdown recorded in each trade dict.
+
+    Sizing:
+      fixed_lots → that many SCALE lots (each leg uses its own leg["lots"] ratio)
+      % of Capital → lots = floor(budget / |spread_cost_per_lot|)
+
+    is_intraday: force-close all positions at eod_exit_time each trading day
+    eod_exit_time: datetime.time object for EOD square-off (default 15:15)
     """
     cash, pos_lots, entry_spread, entry_time = capital, 0, 0.0, None
     in_trade = False
     equities, trades = [], []
 
+    # Determine price column
     if trade_options and spread_legs and "spread_price" in df.columns:
         price_col = "spread_price"
         is_spread  = True
@@ -612,6 +619,7 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
         price_col = "close"
         is_spread  = False
 
+    # Build per-leg price lookups for spread mode
     leg_price_series = {}
     if is_spread and spread_legs:
         ts_index = df["timestamp"].values
@@ -620,21 +628,74 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                 pd.Index(ts_index)
             ).ffill().fillna(0).values
 
-    df_ts = df["timestamp"].values
+    df_ts = df["timestamp"].values  # fast numpy access
+
+    import datetime as _dt
+    # Resolve EOD exit time
+    if is_intraday and eod_exit_time is not None:
+        _eod_h, _eod_m = eod_exit_time.hour, eod_exit_time.minute
+    else:
+        _eod_h, _eod_m = 15, 15   # default fallback
 
     for row_i, row in df.iterrows():
-        sig       = row["signal"]
-        ts        = row["timestamp"]
+        sig = row["signal"]
+        ts  = row["timestamp"]
         raw_price = row[price_col]
 
         if pd.isna(raw_price):
             equities.append(cash + pos_lots * (entry_spread if in_trade else 0))
             continue
 
+        # Spread price = net debit/credit per scale-lot
         spread_price = float(raw_price)
 
-        # ── ENTRY (signal = 1) ───────────────────────────────────────────────
-        if sig == 1 and not in_trade:
+        # ── INTRADAY EOD FORCE-CLOSE ──────────────────────────────────────
+        # If Intraday mode: square off at/after eod_exit_time on each day
+        if is_intraday and in_trade:
+            bar_time = ts.time() if hasattr(ts, "time") else (
+                _dt.datetime.fromtimestamp(ts.timestamp()).time()
+                if hasattr(ts, "timestamp") else None
+            )
+            if bar_time and bar_time >= _dt.time(_eod_h, _eod_m):
+                eod_spread = spread_price
+                qty        = pos_lots * lot_size
+                pnl        = (eod_spread - entry_spread) * qty - abs(eod_spread) * qty * comm_pct
+                cash      += abs(entry_spread) * qty + pnl
+                trade_rec  = {
+                    "entry_time":  entry_time, "exit_time": ts,
+                    "entry_price": round(entry_spread, 2), "exit_price": round(eod_spread, 2),
+                    "qty": qty, "lots": pos_lots,
+                    "pnl": round(pnl, 2),
+                    "return_pct": round((eod_spread / entry_spread - 1) * 100, 2) if entry_spread != 0 else 0.0,
+                    "exit_reason": "EOD Square-off",
+                    "strike": row.get("strike", "-"),
+                }
+                if is_spread and spread_legs:
+                    for i, ld in enumerate(spread_legs):
+                        lp_arr = leg_price_series.get(i)
+                        if lp_arr is not None and row_i < len(lp_arr):
+                            try:
+                                eidx = list(df_ts).index(entry_time)
+                                ep = float(lp_arr[eidx]); xp = float(lp_arr[row_i])
+                            except (ValueError, IndexError):
+                                ep = xp = 0.0
+                            sign = 1 if ld["direction"] == "BUY" else -1
+                            trade_rec[f"leg{i+1}_{ld['strike_lbl']}_{ld['opt_type']}"] = round(
+                                sign * (xp - ep) * ld["lots"] * lot_size, 2)
+                trades.append(trade_rec)
+                pos_lots, in_trade = 0, False
+                equities.append(cash)
+                continue  # skip further processing for this bar
+
+        # ── ENTRY — trigger on BUY signal (or SELL signal for short legs) ──
+        # Entry fires on sig==1 (long) or sig==-1 when no position open
+        # In Intraday mode: block new entries after EOD time
+        _bar_time_now = ts.time() if hasattr(ts, "time") else None
+        _block_entry  = is_intraday and _bar_time_now and _bar_time_now >= _dt.time(_eod_h, _eod_m)
+        entry_triggered = (sig == 1 and not in_trade and not _block_entry)
+
+        if entry_triggered:
+            # Cost basis: |spread_price| × lot_size per scale-lot
             cost_per_lot = abs(spread_price) * lot_size
             if cost_per_lot < 0.01:
                 equities.append(cash)
@@ -653,53 +714,56 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                 entry_time   = ts
                 in_trade     = True
 
-        # ── EXIT (signal = -1) — matches Pine strategy.close("BUY") ─────────
+        # ── EXIT — on sell signal OR new buy when already in trade ─────────
         elif in_trade and sig == -1:
             exit_spread = spread_price
-            qty         = pos_lots * lot_size
+            qty         = pos_lots * lot_size  # total underlying units
 
             gross_pnl = (exit_spread - entry_spread) * qty
             comm_cost = abs(exit_spread) * qty * comm_pct
             pnl       = gross_pnl - comm_cost
-            cash     += abs(entry_spread) * qty + pnl
+            cash     += abs(entry_spread) * qty + pnl  # return capital + P&L
 
             trade_rec = {
-                "entry_time":  entry_time,
-                "exit_time":   ts,
-                "entry_price": round(entry_spread, 2),
-                "exit_price":  round(exit_spread,  2),
-                "qty":         qty,
-                "lots":        pos_lots,
-                "pnl":         round(pnl, 2),
-                "return_pct":  round((exit_spread / entry_spread - 1) * 100, 2)
-                               if entry_spread != 0 else 0.0,
-                "exit_reason": "Signal",
-                "strike":      row.get("strike", "-"),
+                "entry_time":    entry_time,
+                "exit_time":     ts,
+                "entry_price":   round(entry_spread, 2),
+                "exit_price":    round(exit_spread,  2),
+                "qty":           qty,
+                "lots":          pos_lots,
+                "pnl":           round(pnl, 2),
+                "return_pct":    round((exit_spread / entry_spread - 1) * 100, 2)
+                                 if entry_spread != 0 else 0.0,
+                "exit_reason":   "Signal",
+                "strike":        row.get("strike", "-"),
             }
 
+            # Per-leg P&L breakdown for spread trades
             if is_spread and spread_legs:
                 for i, ld in enumerate(spread_legs):
-                    lp_arr = leg_price_series.get(i)
+                    lp_arr  = leg_price_series.get(i)
                     if lp_arr is not None and row_i < len(lp_arr):
+                        # Find entry row index (approx by timestamp match)
                         try:
                             entry_idx = list(df_ts).index(entry_time)
                             ep = float(lp_arr[entry_idx])
                             xp = float(lp_arr[row_i])
                         except (ValueError, IndexError):
                             ep = xp = 0.0
-                        sign    = 1 if ld["direction"] == "BUY" else -1
-                        leg_pnl = sign * (xp - ep) * ld["lots"] * lot_size
+                        sign      = 1 if ld["direction"] == "BUY" else -1
+                        leg_pnl   = sign * (xp - ep) * ld["lots"] * lot_size
                         trade_rec[f"leg{i+1}_{ld['strike_lbl']}_{ld['opt_type']}"] = round(leg_pnl, 2)
 
             trades.append(trade_rec)
             pos_lots, in_trade = 0, False
 
+        # Mark-to-market equity
         mtm = spread_price * pos_lots * lot_size if in_trade else 0
         equities.append(cash + mtm)
 
     # Force-close open position at last bar
     if in_trade and pos_lots > 0:
-        lp  = float(df[price_col].iloc[-1])
+        lp = float(df[price_col].iloc[-1])
         qty = pos_lots * lot_size
         pnl = (lp - entry_spread) * qty - abs(lp) * qty * comm_pct
         cash += abs(entry_spread) * qty + pnl
@@ -739,6 +803,140 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
     return results, trades
 
 
+def run_backtest_dual(
+    ce_df: pd.DataFrame, pe_df: pd.DataFrame,
+    capital: float, size_pct: float, comm_pct: float, lot_size: int,
+    buy_lvl: float, sell_lvl: float,
+    bsp_length: int, signal_mode: str, ema_filter: bool,
+    fixed_lots: int = None,
+    is_intraday: bool = False,
+    eod_exit_time=None
+) -> tuple[pd.DataFrame, list]:
+    """
+    Strike-chart dual backtest.
+    - ce_df: ATM CE candles with OI+Volume → BSP computed → CE signals
+    - pe_df: ATM PE candles with OI+Volume → BSP computed → PE signals
+    - CE signal fires CE BUY trade (buy call when CE OI+Vol momentum is bullish)
+    - PE signal fires PE BUY trade (buy put when PE OI+Vol momentum is bullish)
+    - Both legs tracked independently; combined equity curve returned.
+    """
+    import datetime as _dt
+
+    # Compute BSP and signals on each strike df
+    ce_df = ce_df.copy()
+    pe_df = pe_df.copy()
+    ce_df["bsp"] = calc_bsp_oiv(ce_df, bsp_length)
+    pe_df["bsp"] = calc_bsp_oiv(pe_df, bsp_length)
+    ce_df = generate_signals(ce_df, buy_lvl, sell_lvl, ema_filter=ema_filter, signal_mode=signal_mode)
+    pe_df = generate_signals(pe_df, buy_lvl, sell_lvl, ema_filter=ema_filter, signal_mode=signal_mode)
+
+    # Align both dataframes on timestamp
+    ce_df = ce_df.set_index("timestamp").sort_index()
+    pe_df = pe_df.set_index("timestamp").sort_index()
+
+    all_ts = ce_df.index.union(pe_df.index)
+    ce_df  = ce_df.reindex(all_ts).ffill()
+    pe_df  = pe_df.reindex(all_ts).ffill()
+
+    if is_intraday and eod_exit_time is not None:
+        _eod_h, _eod_m = eod_exit_time.hour, eod_exit_time.minute
+    else:
+        _eod_h, _eod_m = 15, 15
+
+    cash = capital
+    equities, trades = [], []
+
+    # CE leg state
+    ce_in_trade = False; ce_lots = 0; ce_entry_price = 0.0; ce_entry_time = None
+    # PE leg state
+    pe_in_trade = False; pe_lots = 0; pe_entry_price = 0.0; pe_entry_time = None
+
+    def _lots(price):
+        if fixed_lots:
+            return fixed_lots
+        if price <= 0:
+            return 0
+        budget = cash * size_pct
+        return max(1, int(budget / (abs(price) * lot_size)))
+
+    for ts in all_ts:
+        ce_row = ce_df.loc[ts] if ts in ce_df.index else None
+        pe_row = pe_df.loc[ts] if ts in pe_df.index else None
+
+        ce_sig = int(ce_row["signal"]) if ce_row is not None and pd.notna(ce_row.get("signal")) else 0
+        pe_sig = int(pe_row["signal"]) if pe_row is not None and pd.notna(pe_row.get("signal")) else 0
+        ce_price = float(ce_row["close"]) if ce_row is not None and pd.notna(ce_row.get("close")) else None
+        pe_price = float(pe_row["close"]) if pe_row is not None and pd.notna(pe_row.get("close")) else None
+
+        bar_time = ts.time() if hasattr(ts, "time") else None
+        is_eod   = bar_time and bar_time >= _dt.time(_eod_h, _eod_m) if is_intraday else False
+
+        def _exit(in_trade, lots, entry_price, entry_time, price, reason, leg):
+            nonlocal cash
+            if not in_trade or price is None:
+                return False, 0, 0.0, None
+            qty = lots * lot_size
+            pnl = (price - entry_price) * qty - abs(price) * qty * comm_pct
+            cash += abs(entry_price) * qty + pnl
+            trades.append({
+                "leg": leg,
+                "entry_time":  entry_time,  "exit_time": ts,
+                "entry_price": round(entry_price, 2), "exit_price": round(price, 2),
+                "qty": qty, "lots": lots,
+                "pnl": round(pnl, 2),
+                "return_pct": round((price / entry_price - 1) * 100, 2) if entry_price != 0 else 0.0,
+                "exit_reason": reason,
+            })
+            return False, 0, 0.0, None
+
+        # ── CE leg ──────────────────────────────────────────────────────────
+        if ce_price is not None:
+            if is_eod and ce_in_trade:
+                ce_in_trade, ce_lots, ce_entry_price, ce_entry_time = _exit(
+                    ce_in_trade, ce_lots, ce_entry_price, ce_entry_time, ce_price, "EOD", "CE")
+            elif ce_sig == 1 and not ce_in_trade:
+                n = _lots(ce_price)
+                if n > 0:
+                    cost = abs(ce_price) * n * lot_size
+                    if cash >= cost:
+                        cash -= cost
+                        ce_in_trade = True; ce_lots = n
+                        ce_entry_price = ce_price; ce_entry_time = ts
+            elif ce_sig == -1 and ce_in_trade:
+                ce_in_trade, ce_lots, ce_entry_price, ce_entry_time = _exit(
+                    ce_in_trade, ce_lots, ce_entry_price, ce_entry_time, ce_price, "Signal", "CE")
+
+        # ── PE leg ──────────────────────────────────────────────────────────
+        if pe_price is not None:
+            if is_eod and pe_in_trade:
+                pe_in_trade, pe_lots, pe_entry_price, pe_entry_time = _exit(
+                    pe_in_trade, pe_lots, pe_entry_price, pe_entry_time, pe_price, "EOD", "PE")
+            elif pe_sig == 1 and not pe_in_trade:
+                n = _lots(pe_price)
+                if n > 0:
+                    cost = abs(pe_price) * n * lot_size
+                    if cash >= cost:
+                        cash -= cost
+                        pe_in_trade = True; pe_lots = n
+                        pe_entry_price = pe_price; pe_entry_time = ts
+            elif pe_sig == -1 and pe_in_trade:
+                pe_in_trade, pe_lots, pe_entry_price, pe_entry_time = _exit(
+                    pe_in_trade, pe_lots, pe_entry_price, pe_entry_time, pe_price, "Signal", "PE")
+
+        # Mark-to-market equity
+        mtm = cash
+        if ce_in_trade and ce_price:
+            mtm += (ce_price - ce_entry_price) * ce_lots * lot_size
+        if pe_in_trade and pe_price:
+            mtm += (pe_price - pe_entry_price) * pe_lots * lot_size
+        equities.append(mtm)
+
+    results = pd.DataFrame({"timestamp": list(all_ts), "equity": equities[:len(all_ts)]})
+    results["peak"]         = results["equity"].cummax()
+    results["drawdown_pct"] = (results["equity"] - results["peak"]) / results["peak"] * 100
+    return results, trades
+
+
 def metrics(results: pd.DataFrame, trades: list, capital: float) -> dict:
     import math
 
@@ -746,6 +944,7 @@ def metrics(results: pd.DataFrame, trades: list, capital: float) -> dict:
     pnl   = final - capital
     ret   = round(pnl / capital * 100, 2)
 
+    # CAGR — clamp to ±10000% to avoid astronomical display
     n_days = max((results["timestamp"].iloc[-1] - results["timestamp"].iloc[0]).days, 1)
     ratio  = max(final / capital, 1e-10) if capital > 0 else 1.0
     try:
@@ -756,9 +955,10 @@ def metrics(results: pd.DataFrame, trades: list, capital: float) -> dict:
 
     max_dd = round(results["drawdown_pct"].min(), 2)
 
+    # Sharpe/Sortino on DAILY returns (not bar-by-bar — avoids intraday inflation)
     try:
-        daily   = results.set_index("timestamp")["equity"].resample("D").last().dropna()
-        d_rets  = daily.pct_change().dropna()
+        daily  = results.set_index("timestamp")["equity"].resample("D").last().dropna()
+        d_rets = daily.pct_change().dropna()
         sharpe  = round(float(d_rets.mean() / d_rets.std() * math.sqrt(252)), 3) if len(d_rets) > 1 and d_rets.std() > 0 else 0.0
         neg     = d_rets[d_rets < 0]
         sortino = round(float(d_rets.mean() / neg.std() * math.sqrt(252)), 3) if len(neg) > 1 and neg.std() > 0 else 0.0
@@ -797,68 +997,116 @@ def metrics(results: pd.DataFrame, trades: list, capital: float) -> dict:
 
 with st.sidebar:
 
+    # ── Token Status ─────────────────────────────────────────────────────────
     cfg = DhanConfig()
     if cfg.access_token and cfg.access_token != "paste_your_token_here":
         st.success(f"✅ Token configured · Client: `{cfg.client_id}`")
     else:
         st.error("❌ Token not set — update `access_token` in DhanConfig at top of app.py")
 
+    # ── Index Selection ──────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-header">📊 Index Settings</div>', unsafe_allow_html=True)
 
     index_name = st.selectbox("Select Index", list(INDICES.keys()), index=0)
     idx_cfg    = INDICES[index_name]
     lot_size   = idx_cfg["lot_size"]
     strike_gap = idx_cfg["strike_gap"]
+
     st.caption(f"Lot Size: **{lot_size}** | Strike Gap: **{strike_gap}**")
 
-    interval_map = {
-        "1 Min":"1", "5 Min":"5", "15 Min":"15",
-        "25 Min":"25", "60 Min":"60", "Daily":"D"
-    }
-    interval_lbl = st.selectbox("Timeframe", list(interval_map.keys()), index=3)
-    interval     = interval_map[interval_lbl]
+    # ── Trade Style ────────────────────────────────────────────────────────
+    trade_style = st.radio(
+        "Trade Style",
+        ["📈 Intraday", "🌙 Carry Forward"],
+        horizontal=True,
+        help="Intraday: positions force-squared off at EOD each day.\n"
+             "Carry Forward: positions held overnight until exit signal fires.",
+    )
+    is_intraday = trade_style == "📈 Intraday"
 
-    # ── FIX 2 (UI): BSP Timeframe selector ───────────────────────────────────
-    # Pine default: bsp = request.security(syminfo.tickerid, "D", mf)
-    # i.e. BSP is ALWAYS computed on Daily bars regardless of chart TF
-    st.markdown('<div class="sidebar-header">📅 BSP Timeframe</div>', unsafe_allow_html=True)
-    bsp_tf_choice = st.radio(
-        "BSP Source Timeframe",
-        ["🗓 Daily (Pine Default ✅)", "📊 Same as Chart"],
+    if is_intraday:
+        INTRADAY_TF = {
+            "1 Min": "1", "3 Min": "3", "5 Min": "5",
+            "10 Min": "10", "15 Min": "15", "25 Min": "25",
+        }
+        interval_lbl = st.selectbox("Timeframe", list(INTRADAY_TF.keys()), index=2,
+                                     help="Intraday timeframes only")
+        interval     = INTRADAY_TF[interval_lbl]
+        c_eod1, c_eod2 = st.columns(2)
+        with c_eod1:
+            eod_hour   = st.number_input("EOD Exit Hour",   min_value=9,  max_value=15, value=15, step=1)
+        with c_eod2:
+            eod_minute = st.number_input("EOD Exit Minute", min_value=0,  max_value=59, value=15, step=5)
+        import datetime as _dt2
+        eod_exit_time = _dt2.time(int(eod_hour), int(eod_minute))
+    else:
+        CF_TF = {
+            "5 Min": "5", "15 Min": "15", "25 Min": "25",
+            "60 Min": "60", "Daily": "D",
+        }
+        interval_lbl = st.selectbox("Timeframe", list(CF_TF.keys()), index=4,
+                                     help="Carry Forward — positions held overnight")
+        interval     = CF_TF[interval_lbl]
+        eod_exit_time = None
+
+    bsp_tf = st.selectbox(
+        "BSP Timeframe",
+        ["Daily (Pine Default ✅)", "Same as Chart"],
         index=0,
         help=(
-            "🗓 Daily (Pine Default): matches TradingView exactly.\n"
-            "Pine Script uses request.security(..., 'D', mf) — BSP is ALWAYS computed "
-            "on Daily bars regardless of chart timeframe. Each intraday bar receives "
-            "the daily BSP value for that date.\n\n"
-            "📊 Same as Chart: BSP computed on selected candle interval. "
-            "Faster (no extra API call) but deviates from Pine."
+            "Daily (Pine Default): matches TradingView Pine Script exactly. "
+            "Pine uses request.security(..., 'D', mf) — BSP is ALWAYS computed on Daily bars "
+            "regardless of chart timeframe.\n\n"
+            "Same as Chart: BSP computed on your selected candle interval."
         )
     )
-    use_daily_bsp = "Daily" in bsp_tf_choice
+    use_daily_bsp = "Daily" in bsp_tf
 
     c1, c2 = st.columns(2)
-    with c1: from_date = st.date_input("From", datetime.now() - timedelta(days=365))
-    with c2: to_date   = st.date_input("To",   datetime.now())
+    with c1:
+        default_from = (datetime.now() - timedelta(days=30)) if is_intraday else (datetime.now() - timedelta(days=365))
+        from_date = st.date_input("From", default_from)
+    with c2:
+        to_date = st.date_input("To", datetime.now())
 
-    # ── Backtest Mode ─────────────────────────────────────────────────────────
+    if is_intraday and (to_date - from_date).days > 90:
+        st.warning("⚠️ Intraday data: Dhan API allows max ~90 days per call. Consider shorter ranges for speed.")
+
+    # ── Backtest Mode ────────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-header">🎯 Backtest Mode</div>', unsafe_allow_html=True)
 
     backtest_mode = st.radio(
         "Trade on",
-        ["Index (Futures-style)", "Options (Real Data)"],
+        ["Index (Futures-style)", "Options (Real Data)", "Strike Chart (ATM CE+PE)"],
         index=0,
-        help="Index mode: signals on index OHLCV. Options: real premium from Dhan rollingoption API."
+        help=(
+            "Index mode: signals on Nifty index OHLCV.\n\n"
+            "Options (Real Data): signals on index, trades real option premiums.\n\n"
+            "Strike Chart: BSP computed on ATM CE and PE candles independently. "
+            "CE signal -> CE buy trade; PE signal -> PE buy trade. OI x Volume used as BSP weight."
+        )
     )
-    trade_options = backtest_mode == "Options (Real Data)"
+    trade_options     = backtest_mode == "Options (Real Data)"
+    strike_chart_mode = backtest_mode == "Strike Chart (ATM CE+PE)"
+
+    if strike_chart_mode:
+        st.markdown('<div class="sidebar-header">📌 Strike Chart Settings</div>', unsafe_allow_html=True)
+        sc_expiry_flag = st.radio("Expiry Type", ["WEEK", "MONTH"], horizontal=True,
+                               help="Weekly or Monthly expiry contract", key="sc_expiry")
+        sc_lots = st.number_input("Lots per leg", min_value=1, max_value=50, value=1,
+                                  help="CE leg lots and PE leg lots are independent")
+        st.info("BSP on ATM CE candles -> CE BUY trade. BSP on ATM PE candles -> PE BUY trade.")
 
     if trade_options:
-        st.markdown('<div class="sidebar-header">📌 Option Legs</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-header">📌 Option Legs (Spread / Hedge)</div>', unsafe_allow_html=True)
 
-        expiry_flag = st.radio("Expiry Type", ["WEEK", "MONTH"], horizontal=True)
+        expiry_flag = st.radio("Expiry Type", ["WEEK", "MONTH"], horizontal=True,
+                               help="Weekly or Monthly expiry contract")
 
-        n_legs = st.selectbox("Number of Legs", [1, 2, 3, 4], index=0)
+        n_legs = st.selectbox("Number of Legs", [1, 2, 3, 4], index=0,
+                              help="1 = Single option | 2 = Spread | 3-4 = Complex (Iron Condor etc.)")
 
+        # Preset templates
         PRESETS = {
             "Custom": None,
             "Bull Call Spread":  [("CALL","ATM",0,"BUY"),  ("CALL","ATM+1",1,"SELL")],
@@ -880,6 +1128,7 @@ with st.sidebar:
         option_legs = []
         for i in range(n_legs):
             with st.expander(f"Leg {i+1}", expanded=True):
+                # Auto-fill from preset
                 if preset != "Custom" and PRESETS[preset] and i < len(PRESETS[preset]):
                     p_type, p_label, p_off, p_dir = PRESETS[preset][i]
                     def_type = 0 if p_type == "CALL" else 1
@@ -897,68 +1146,61 @@ with st.sidebar:
                                         index=def_dir, horizontal=True, key=f"leg_dir_{i}")
 
                 leg_strike_lbl = st.select_slider(
-                    f"Strike##leg{i}", options=offset_labels,
+                    f"Strike##leg{i}",
+                    options=offset_labels,
                     value=def_off if def_off in offset_labels else "ATM",
                     key=f"leg_strike_{i}"
                 )
                 leg_offset = offsets_list[offset_labels.index(leg_strike_lbl)]
                 leg_lots   = st.number_input(f"Lots##leg{i}", min_value=1, max_value=50,
                                               value=1, key=f"leg_lots_{i}")
+
                 option_legs.append({
                     "opt_type":    "CALL" if "CE" in leg_type else "PUT",
-                    "direction":   leg_dir,
+                    "direction":   leg_dir,          # "BUY" or "SELL"
                     "offset":      leg_offset,
                     "strike_lbl":  leg_strike_lbl,
                     "lots":        int(leg_lots),
                 })
 
+        # Backward compat single-leg variables
         opt_type      = option_legs[0]["opt_type"]
         strike_offset = option_legs[0]["offset"]
 
+        # Strategy summary
         leg_summaries = " | ".join(
             f"{lg['direction']} {lg['lots']}L {lg['strike_lbl']} {lg['opt_type']}"
             for lg in option_legs
         )
         st.info(f"**Strategy:** {leg_summaries}")
 
-    # ── Strategy Parameters ───────────────────────────────────────────────────
+    # ── Strategy Parameters ──────────────────────────────────────────────────
     st.markdown('<div class="sidebar-header">⚙️ Strategy Parameters</div>', unsafe_allow_html=True)
 
-    pivot_length  = st.slider("Pivot Lookback",   3, 20, 5)
-    bsp_length    = st.slider("BSP Length",        5, 50, 21)
-    bsp_buy_lvl   = st.number_input("BSP Buy Level",  value=0.08,  step=0.01, format="%.2f")
-    bsp_sell_lvl  = st.number_input("BSP Sell Level", value=-0.08, step=0.01, format="%.2f")
+    pivot_length = st.slider("Pivot Lookback",  3, 20, 5)
+    bsp_length   = st.slider("BSP Length",      5, 50, 21)
+    bsp_buy_lvl  = st.number_input("BSP Buy Level",  value=0.08,  step=0.01, format="%.2f")
+    bsp_sell_lvl = st.number_input("BSP Sell Level", value=-0.08, step=0.01, format="%.2f")
     vol_threshold = st.slider("Volume Threshold",   1.0, 3.0, 1.5, 0.1)
     vol_period    = st.slider("Volume SMA Period",   5,  30,  14)
 
-    # ── FIX 3+4 (UI): Signal Mode with Pine Exact as default ─────────────────
     st.markdown('<div class="sidebar-header">🎚️ Signal Mode</div>', unsafe_allow_html=True)
     signal_mode = st.selectbox(
         "Signal Mode",
-        ["Pine Exact ✅", "Level Hold", "Flip", "BSP Only"],
-        index=0,
+        ["Flip", "Level Hold", "BSP Only"],
+        index=1,
         help=(
-            "Pine Exact ✅ — 100% matches TradingView Pine Script:\n"
-            "  ENTRY: bsp > buyLevel AND close > ema20 AND ema20 > ema50\n"
-            "  EXIT:  bsp < sellLevel AND close < ema20 AND ema20 < ema50\n"
-            "  Long trades only — mirrors strategy.entry/close BUY\n\n"
-            "Level Hold — sustained BSP; exit at BSP neutral zone (more trades)\n"
-            "Flip — trade only on BSP level cross (fewest signals)\n"
-            "BSP Only — no EMA filter, pure threshold"
+            "Flip: trade only on BSP level CROSS — fewest signals, can miss trades on long history\n"
+            "Level Hold: enter while BSP above threshold, exit when BSP returns to 0 — balanced\n"
+            "BSP Only: no EMA filter, pure BSP — most signals, good for long backtests"
         )
     )
-    # Normalise the label (strip the ✅ emoji for internal logic)
-    signal_mode_key = signal_mode.replace(" ✅", "").strip()
-
     ema_filter = st.checkbox(
         "EMA Trend Filter",
-        value=(signal_mode_key not in ["BSP Only"]),
-        help="Required for Pine Exact. Checks EMA20 > EMA50 alignment before entering.",
-        disabled=(signal_mode_key in ["BSP Only", "Pine Exact"])
+        value=(signal_mode != "BSP Only"),
+        help="Require EMA20 > EMA50 for longs (and vice-versa). Uncheck for more signals on longer histories.",
+        disabled=(signal_mode == "BSP Only")
     )
-    # Pine Exact always uses EMA filter — override
-    if signal_mode_key == "Pine Exact":
-        ema_filter = True
 
     st.markdown('<div class="sidebar-header">📈 EMA Display</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
@@ -970,18 +1212,40 @@ with st.sidebar:
         show_e200 = st.checkbox("EMA 200", True)
 
     st.markdown('<div class="sidebar-header">💼 Capital & Sizing</div>', unsafe_allow_html=True)
-    init_capital = st.number_input("Initial Capital (₹)", value=500000, step=50000)
-    sizing_mode  = st.radio("Position Sizing", ["% of Capital", "Fixed Lots"], horizontal=True)
+    init_capital  = st.number_input("Initial Capital (₹)", value=500000, step=50000)
+    sizing_mode   = st.radio("Position Sizing", ["% of Capital", "Fixed Lots"], horizontal=True)
     if sizing_mode == "% of Capital":
         pos_size_pct = st.slider("Position Size (%)", 5, 100, 50)
         fixed_lots   = None
     else:
         fixed_lots   = st.number_input("Fixed Lots per Trade", min_value=1, max_value=100, value=1, step=1)
-        pos_size_pct = 100
+        pos_size_pct = 100   # unused in fixed mode, placeholder
     comm_pct = st.number_input("Commission (%)", value=0.03, step=0.01, format="%.3f")
 
+    st.markdown('<div class="sidebar-header">🔄 Trade Style</div>', unsafe_allow_html=True)
+    trade_style = st.radio(
+        "Position Carrying",
+        ["📅 Intraday (MIS)", "📆 Carry Forward (NRML)"],
+        index=0,
+        help=(
+            "Intraday (MIS): All open positions are force-closed at 15:15 IST each day.\n"
+            "Carry Forward (NRML): Positions can be held overnight across multiple days."
+        )
+    )
+    is_intraday = (trade_style == "📅 Intraday (MIS)")
+
+    if is_intraday:
+        eod_exit_time = st.time_input(
+            "EOD Square-off Time",
+            value=__import__("datetime").time(15, 15),
+            help="Force-close all positions at this time each day (default 15:15 IST)"
+        )
+    else:
+        eod_exit_time = None
+
     st.markdown('<div class="sidebar-header">🛠️ Debug</div>', unsafe_allow_html=True)
-    debug_mode = st.checkbox("Show API request/response", False)
+    debug_mode = st.checkbox("Show API request/response", False,
+                              help="Shows raw payloads and responses to diagnose API errors")
 
     run_btn = st.button("🚀 Run Backtest", type="primary", use_container_width=True)
 
@@ -990,27 +1254,140 @@ with st.sidebar:
 # HEADER
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("## 📡 NYZTrade · SMC Liquidity Lens — Index Backtest")
+st.markdown(f"## 📡 NYZTrade · SMC Liquidity Lens — Index Backtest")
 st.caption("Smart Money Concepts + BSP Oscillator + FVG | Indian Indices | Dhan API")
-
-# Show alignment badge
-pine_col, _ = st.columns([2, 3])
-with pine_col:
-    st.markdown(
-        '<div class="pine-badge">🌲 Pine Script Forensic Fixes Applied — v4</div>',
-        unsafe_allow_html=True
-    )
-
 st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN BACKTEST FLOW
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 if run_btn:
 
-    # ── 1. Fetch Index OHLCV ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # STRIKE CHART MODE — BSP on ATM CE and PE candles independently
+    # ══════════════════════════════════════════════════════════════════════════
+    if strike_chart_mode:
+        fetch_interval = interval if interval != "D" else "25"
+        fd = from_date.strftime("%Y-%m-%d")
+        td = to_date.strftime("%Y-%m-%d")
+
+        with st.spinner("📡 Fetching ATM CE candle data (OI+Volume)…"):
+            ce_raw = _fetcher.fetch_rolling_option(
+                idx_cfg["security_id"], 0, "CALL",
+                fd, td, interval=fetch_interval,
+                expiry_flag=sc_expiry_flag, debug=debug_mode
+            )
+        with st.spinner("📡 Fetching ATM PE candle data (OI+Volume)…"):
+            pe_raw = _fetcher.fetch_rolling_option(
+                idx_cfg["security_id"], 0, "PUT",
+                fd, td, interval=fetch_interval,
+                expiry_flag=sc_expiry_flag, debug=debug_mode
+            )
+
+        if ce_raw is None or ce_raw.empty:
+            st.error("❌ No CE data returned. Check token / date range.")
+            st.stop()
+        if pe_raw is None or pe_raw.empty:
+            st.error("❌ No PE data returned. Check token / date range.")
+            st.stop()
+
+        st.success(f"✅ CE: **{len(ce_raw):,} bars** | PE: **{len(pe_raw):,} bars**")
+
+        # Signal diagnostics preview
+        _ce_bsp = calc_bsp_oiv(ce_raw, bsp_length)
+        _pe_bsp = calc_bsp_oiv(pe_raw, bsp_length)
+        with st.expander("🔍 Strike BSP Diagnostics", expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("CE BSP Min", round(float(_ce_bsp.min()), 4))
+            c2.metric("CE BSP Max", round(float(_ce_bsp.max()), 4))
+            c3.metric("PE BSP Min", round(float(_pe_bsp.min()), 4))
+            c4.metric("PE BSP Max", round(float(_pe_bsp.max()), 4))
+
+        with st.spinner("📊 Running dual-strike backtest…"):
+            results, trades = run_backtest_dual(
+                ce_raw, pe_raw,
+                capital=init_capital,
+                size_pct=pos_size_pct / 100,
+                comm_pct=comm_pct / 100,
+                lot_size=lot_size,
+                buy_lvl=bsp_buy_lvl, sell_lvl=bsp_sell_lvl,
+                bsp_length=bsp_length,
+                signal_mode=signal_mode,
+                ema_filter=ema_filter,
+                fixed_lots=int(sc_lots),
+                is_intraday=is_intraday,
+                eod_exit_time=eod_exit_time
+            )
+            m = metrics(results, trades, init_capital)
+
+        st.info(f"📌 **Strike Chart Mode** · {index_name} · ATM CE + PE | {interval_lbl} | {sc_expiry_flag}")
+
+        # ── Metrics Banner ────────────────────────────────────────────────
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Net P&L",        f"₹{m['net_pnl']:,.0f}")
+        c2.metric("Total Return",   f"{m['total_return_pct']:.1f}%")
+        c3.metric("Total Trades",   m["total_trades"])
+        c4.metric("Win Rate",       f"{m['win_rate']:.1f}%")
+        c5.metric("Max Drawdown",   f"{m['max_dd']:.1f}%")
+        c6.metric("Sharpe Ratio",   f"{m['sharpe']:.2f}")
+
+        # ── CE / PE split ─────────────────────────────────────────────────
+        ce_trades = [t for t in trades if t.get("leg") == "CE"]
+        pe_trades = [t for t in trades if t.get("leg") == "PE"]
+        col_ce, col_pe = st.columns(2)
+        with col_ce:
+            st.markdown("#### 📈 CE Trades")
+            st.metric("Count", len(ce_trades))
+            if ce_trades:
+                ce_pnl = sum(t["pnl"] for t in ce_trades)
+                ce_wins = sum(1 for t in ce_trades if t["pnl"] > 0)
+                st.metric("P&L", f"₹{ce_pnl:,.0f}")
+                st.metric("Win Rate", f"{ce_wins/len(ce_trades)*100:.1f}%")
+        with col_pe:
+            st.markdown("#### 📉 PE Trades")
+            st.metric("Count", len(pe_trades))
+            if pe_trades:
+                pe_pnl = sum(t["pnl"] for t in pe_trades)
+                pe_wins = sum(1 for t in pe_trades if t["pnl"] > 0)
+                st.metric("P&L", f"₹{pe_pnl:,.0f}")
+                st.metric("Win Rate", f"{pe_wins/len(pe_trades)*100:.1f}%")
+
+        # ── Equity Curve ──────────────────────────────────────────────────
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            x=results["timestamp"], y=results["equity"],
+            mode="lines", name="Equity", line=dict(color="#00d4b4", width=2)
+        ))
+        fig_eq.update_layout(
+            title="Equity Curve — Strike Chart Mode",
+            paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+            font=dict(color="#c9d1d9"),
+            xaxis=dict(gridcolor="#21262d"), yaxis=dict(gridcolor="#21262d"),
+            height=350, margin=dict(l=10, r=10, t=40, b=10)
+        )
+        st.plotly_chart(fig_eq, use_container_width=True)
+
+        # ── Trade Log ────────────────────────────────────────────────────
+        if trades:
+            tdf = pd.DataFrame(trades)
+            tdf["pnl"] = tdf["pnl"].round(2)
+            st.dataframe(tdf, use_container_width=True, height=300)
+            csv = tdf.to_csv(index=False).encode()
+            st.download_button("⬇️ Download Trade Log", csv, "strike_chart_trades.csv", "text/csv")
+        else:
+            st.warning("⚠️ No trades generated. Try loosening BSP levels or switching Signal Mode.")
+
+        st.stop()  # Don't run rest of standard pipeline
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STANDARD MODE (Index / Options)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── 1. Fetch Index OHLCV ─────────────────────────────────────────────────
     with st.spinner(f"📡 Fetching {index_name} OHLCV from Dhan…"):
         df = _fetcher.fetch_index_ohlcv(
             idx_cfg["security_id"],
@@ -1021,12 +1398,12 @@ if run_btn:
         )
 
     if df is None or df.empty:
-        st.error("❌ No index data returned. Try: shorter date range, Daily timeframe, or refresh token.")
+        st.error("❌ No index data returned. Try: shorter date range, Daily timeframe, or refresh your token.")
         st.stop()
 
     st.success(f"✅ Loaded **{len(df):,} bars** for **{index_name}** ({interval_lbl})")
 
-    # ── 2. Indicators ─────────────────────────────────────────────────────────
+    # ── 2. Indicators & Signals ───────────────────────────────────────────────
     with st.spinner("⚙️ Computing indicators…"):
         df["ema20"]   = ema(df["close"], 20)
         df["ema50"]   = ema(df["close"], 50)
@@ -1034,11 +1411,9 @@ if run_btn:
         df["ema200"]  = ema(df["close"], 200)
         df["vol_sma"] = df["volume"].rolling(vol_period).mean()
 
-        # ── FIX 2: BSP Timeframe ─────────────────────────────────────────────
-        # Pine default: request.security(syminfo.tickerid, "D", mf)
-        # Daily BSP is fetched separately and stamped onto intraday bars.
+        # BSP Timeframe — Pine uses request.security(..., 'D', mf) by default
         if use_daily_bsp and interval != "D":
-            with st.spinner("📅 Fetching Daily bars for BSP (Pine-accurate)…"):
+            with st.spinner("📅 Fetching Daily bars for BSP calculation (Pine-accurate)…"):
                 daily_df = _fetcher.fetch_index_ohlcv(
                     idx_cfg["security_id"],
                     from_date.strftime("%Y-%m-%d"),
@@ -1047,95 +1422,49 @@ if run_btn:
                     debug=False
                 )
             df["bsp"] = calc_bsp_daily(df, daily_df, bsp_length)
-            bsp_tf_label = "Daily (Pine-accurate)"
+            st.caption("📅 BSP computed on **Daily** timeframe (matches TradingView Pine Script)")
         else:
-            # Intraday BSP (chart-level) or Daily chart already
-            df["bsp"]   = calc_bsp(df, bsp_length)
-            bsp_tf_label = "Same as Chart"
+            df["bsp"] = calc_bsp(df, bsp_length)
 
         ph   = pivot_highs(df, pivot_length)
         pl   = pivot_lows(df, pivot_length)
         obs  = order_blocks(df, ph, pl, vol_threshold)
         fvgs = fair_value_gaps(df)
+        df   = generate_signals(df, bsp_buy_lvl, bsp_sell_lvl, ema_filter=ema_filter, signal_mode=signal_mode)
 
-        # ── FIX 3 + 4: Generate signals using Pine Exact as default ──────────
-        df = generate_signals(
-            df, bsp_buy_lvl, bsp_sell_lvl,
-            ema_filter=ema_filter,
-            signal_mode=signal_mode_key
-        )
-
-    # ── Forensic Fix Summary Panel ────────────────────────────────────────────
-    with st.expander("🔬 Pine Script Forensic Fixes — What Changed", expanded=False):
-        st.markdown("##### Differences between original Python app and Pine Script — all fixed:")
-        fixes = [
-            ("✅ FIX 1", "BSP Flat-Candle Formula",
-             "**Pine:** `high==low → ad = 0` (exact zero).\n"
-             "**Old Python:** `high==low → NaN → filled 0` (same numeric result but wrong path).\n"
-             "**Fixed:** `np.where(flat, 0.0, ...)` — exact Pine behaviour on every bar."),
-            ("✅ FIX 2", f"BSP Timeframe (currently: **{bsp_tf_label}**)",
-             "**Pine:** `bsp = request.security(syminfo.tickerid, 'D', mf)` — BSP is always "
-             "computed on **Daily bars**, regardless of chart timeframe. Each intraday bar "
-             "gets the daily BSP value for that date stamped onto it.\n"
-             "**Old Python:** BSP computed on chart interval (5min, 15min etc.) — "
-             "completely different oscillator value.\n"
-             f"**Fixed:** `calc_bsp_daily()` fetches separate daily bars and merges by date. "
-             f"Toggle in sidebar: *BSP Source Timeframe*."),
-            ("✅ FIX 3", "Signal Entry Condition",
-             "**Pine:** `longCondition = bsp > bspBuyLevel AND close > ema20 AND ema20 > ema50`\n"
-             "Entry fires whenever BSP is **above** the level (sustained), not just on the cross.\n"
-             "**Old Python default ('Flip'):** entry only on BSP level **cross** — fewest signals, "
-             "misses all sustained-condition bars.\n"
-             "**Fixed:** New default mode **'Pine Exact'** matches Pine entry condition exactly."),
-            ("✅ FIX 4", "Signal Exit Condition",
-             "**Pine:** `shortCondition = bsp < bspSellLevel AND close < ema20 AND ema20 < ema50`\n"
-             "Exit fires when BSP drops below sellLevel **AND** bear EMA alignment.\n"
-             "**Old Python 'Level Hold' exit:** `bsp < 0` (neutral zone) — exits too early, "
-             "no EMA check at all.\n"
-             "**Fixed:** 'Pine Exact' exit uses exact Pine shortCondition. "
-             "Pine only takes LONG trades — signal=-1 = EXIT only (no shorts)."),
-            ("✅ VERIFIED", "EMA Formula",
-             "Both use `ewm(span=N, adjust=False)` = Pine `ta.ema()`. **No change needed.**"),
-        ]
-        for badge, title, detail in fixes:
-            st.markdown(f"**{badge} — {title}**")
-            st.markdown(f'<div class="diff-box">{detail}</div>', unsafe_allow_html=True)
-
-    # ── Signal Diagnostics ────────────────────────────────────────────────────
-    total_bars  = len(df)
-    n_buy_sigs  = int((df["signal"] == 1).sum())
-    n_sell_sigs = int((df["signal"] == -1).sum())
-    bsp_min     = round(float(df["bsp"].min()), 4)
-    bsp_max     = round(float(df["bsp"].max()), 4)
+    # ── 2b. Signal Diagnostics ───────────────────────────────────────────────
+    total_bars   = len(df)
+    n_buy_sigs   = int((df["signal"] == 1).sum())
+    n_sell_sigs  = int((df["signal"] == -1).sum())
+    bsp_min      = round(float(df["bsp"].min()), 4)
+    bsp_max      = round(float(df["bsp"].max()), 4)
 
     with st.expander("🔍 Signal Diagnostics", expanded=(n_buy_sigs == 0 and n_sell_sigs == 0)):
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Total Bars",   f"{total_bars:,}")
         c2.metric("Buy Signals",  n_buy_sigs,  delta=None if n_buy_sigs  > 0 else "⚠️ None")
         c3.metric("Sell Signals", n_sell_sigs, delta=None if n_sell_sigs > 0 else "⚠️ None")
-        c4.metric("BSP Min",      bsp_min)
-        c5.metric("BSP Max",      bsp_max)
-
-        c6, c7 = st.columns(2)
-        c6.metric("Signal Mode",  signal_mode_key)
-        c7.metric("BSP Source",   bsp_tf_label)
+        c4.metric("BSP Min",  bsp_min)
+        c5.metric("BSP Max",  bsp_max)
 
         if n_buy_sigs == 0 and n_sell_sigs == 0:
             st.warning(
                 f"**No signals generated.**\n\n"
-                f"BSP range: **{bsp_min:.4f} → {bsp_max:.4f}** | "
-                f"Thresholds: Buy > **{bsp_buy_lvl}**, Sell < **{bsp_sell_lvl}**\n\n"
-                f"**Try:**\n"
-                f"1. Switch mode to **Level Hold** or **BSP Only**\n"
-                f"2. Loosen BSP levels → Buy: **{round(bsp_max*0.6,3)}** / "
-                f"Sell: **{round(bsp_min*0.6,3)}**\n"
-                f"3. Uncheck EMA Trend Filter\n"
-                f"4. Increase BSP Length"
+                f"BSP range on this data: **{bsp_min:.4f} → {bsp_max:.4f}**\n\n"
+                f"Your thresholds: Buy > **{bsp_buy_lvl}**, Sell < **{bsp_sell_lvl}**\n\n"
+                f"**Fix options (try in order):**\n"
+                f"1. Switch Signal Mode to **BSP Only** or **Level Hold** (sidebar)\n"
+                f"2. Loosen BSP levels — set Buy to **{round(bsp_max*0.6,3)}** and Sell to **{round(bsp_min*0.6,3)}**\n"
+                f"3. Uncheck **EMA Trend Filter**\n"
+                f"4. Increase BSP Length (longer smoothing)"
             )
-            st.info(f"💡 Auto-suggested: Buy **{round(bsp_max*0.5,3)}** / Sell **{round(bsp_min*0.5,3)}**")
+            # Auto-suggest levels based on actual BSP range
+            suggested_buy  = round(bsp_max * 0.5, 3)
+            suggested_sell = round(bsp_min * 0.5, 3)
+            st.info(f"💡 Auto-suggested levels for this dataset: Buy **{suggested_buy}** / Sell **{suggested_sell}**")
 
-    # ── 3. Fetch Option Legs ──────────────────────────────────────────────────
-    leg_dfs = []
+    # ── 3. Fetch Option Legs ─────────────────────────────────────────────────
+    leg_dfs = []   # one price-series df per leg, aligned to main df index
     if trade_options:
         fetch_interval = interval if interval != "D" else "25"
         fd = from_date.strftime("%Y-%m-%d")
@@ -1155,7 +1484,10 @@ if run_btn:
 
             if raw is not None and not raw.empty:
                 st.success(f"✅ {lbl} — {len(raw):,} bars")
-                leg_price = raw[["timestamp","close"]].rename(columns={"close": f"leg{i}_price"})
+                # Merge onto main df timestamps
+                leg_price = raw[["timestamp","close"]].rename(
+                    columns={"close": f"leg{i}_price"}
+                )
                 merged = pd.merge_asof(
                     df[["timestamp"]].sort_values("timestamp"),
                     leg_price.sort_values("timestamp"),
@@ -1165,9 +1497,16 @@ if run_btn:
                 leg_dfs.append({**leg, "prices": merged.set_index("timestamp")[f"leg{i}_price"]})
             else:
                 st.warning(f"⚠️ {lbl} — no data, falling back to Black-Scholes simulation.")
-                sim = simulate_option_prices(df, leg["offset"], strike_gap, leg["opt_type"], 7, 0.15)
+                # BS fallback for this leg
+                sim = simulate_option_prices(
+                    df, leg["offset"], strike_gap, leg["opt_type"], 7, 0.15
+                )
                 leg_dfs.append({**leg, "prices": sim.set_index("timestamp")["opt_price"]})
 
+        # Build combined spread price column on df:
+        # net_price = sum(signed_price per leg)
+        # BUY leg  → pay premium  → negative cash at entry, positive at exit
+        # SELL leg → receive prem → positive cash at entry, negative at exit
         df = df.set_index("timestamp")
         df["spread_price"] = 0.0
         for ld in leg_dfs:
@@ -1176,6 +1515,7 @@ if run_btn:
             df["spread_price"] += sign * p * ld["lots"]
         df = df.reset_index()
 
+        # Legacy single-leg compat (used by chart subplot)
         if leg_dfs:
             df["opt_price"] = leg_dfs[0]["prices"].reindex(
                 df.set_index("timestamp").index
@@ -1187,17 +1527,25 @@ if run_btn:
             df, init_capital, pos_size_pct / 100,
             comm_pct / 100, lot_size, trade_options,
             fixed_lots=fixed_lots,
-            spread_legs=leg_dfs if trade_options else None
+            spread_legs=leg_dfs if trade_options else None,
+            is_intraday=is_intraday,
+            eod_exit_time=eod_exit_time
         )
         m = metrics(results, trades, init_capital)
 
     # ── 5. Mode Banner ────────────────────────────────────────────────────────
+    style_tag = "📅 MIS (Intraday)" if is_intraday else "📆 NRML (Carry Forward)"
+    eod_tag   = f" · EOD {eod_exit_time.strftime('%H:%M')}" if is_intraday and eod_exit_time else ""
     if trade_options:
-        st.info(f"📌 **Options Mode** | {index_name} | {leg_summaries} | {expiry_flag} | BSP: {bsp_tf_label} | Mode: {signal_mode_key}")
+        leg_summaries = " | ".join(
+            f"{lg['direction']} {lg['lots']}L {lg['strike_lbl']} {lg['opt_type']}"
+            for lg in option_legs
+        )
+        st.info(f"📌 **Options Mode** · {style_tag}{eod_tag} | {index_name} | {interval_lbl} | {leg_summaries} | {expiry_flag}")
     else:
-        st.info(f"📈 **Index Mode** | {index_name} | Lot: {lot_size} | BSP: {bsp_tf_label} | Mode: {signal_mode_key}")
+        st.info(f"**{style_tag}**{eod_tag} · Index Mode | {index_name} | {interval_lbl} | Lot Size: {lot_size}")
 
-    # ── 6. KPIs ───────────────────────────────────────────────────────────────
+    # ── 4. KPIs ───────────────────────────────────────────────────────────────
     st.markdown("### 📊 Performance")
     k = st.columns(6)
     k[0].metric("Total Return",  f"{m['total_return']:.1f}%",  delta=f"₹{m['total_pnl']:,.0f}")
@@ -1208,15 +1556,14 @@ if run_btn:
     k[5].metric("Sharpe",        f"{m['sharpe']:.2f}")
     st.divider()
 
-    # ── 7. Tabs ───────────────────────────────────────────────────────────────
+    # ── 5. Tabs ───────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs(["📈 Chart", "📋 Trades", "📉 Equity & DD", "📑 Stats"])
 
     # ─ Chart ──────────────────────────────────────────────────────────────────
     with tab1:
         rows   = 4 if trade_options else 3
         h_rows = [0.50, 0.15, 0.17, 0.18] if trade_options else [0.60, 0.20, 0.20]
-        subs   = (["Price + SMC Levels", "Volume", "BSP Oscillator",
-                   f"Option Premium ({get_strike_label(strike_offset) if trade_options else ''} {opt_type if trade_options else ''})"]
+        subs   = (["Price + SMC Levels", "Volume", "BSP Oscillator", f"Option Premium ({get_strike_label(strike_offset)} {opt_type})"]
                   if trade_options else
                   ["Price + SMC Levels", "Volume", "BSP Oscillator"])
 
@@ -1226,24 +1573,26 @@ if run_btn:
             subplot_titles=subs
         )
 
+        # Candles
         fig.add_trace(go.Candlestick(
             x=df["timestamp"], open=df["open"], high=df["high"],
             low=df["low"], close=df["close"], name=index_name,
             increasing_line_color="#00d4aa", decreasing_line_color="#ff4b6e"
         ), row=1, col=1)
 
+        # EMAs
         for show, col, name, color in [
             (show_e20,  "ema20",  "EMA 20",  "#ff4b6e"),
             (show_e50,  "ema50",  "EMA 50",  "#ff9900"),
             (show_e100, "ema100", "EMA 100", "#00bcd4"),
             (show_e200, "ema200", "EMA 200", "#3f8ef5"),
         ]:
-            if show and col in df.columns:
-                fig.add_trace(go.Scatter(
-                    x=df["timestamp"], y=df[col], name=name,
-                    line=dict(color=color, width=1), opacity=0.85
-                ), row=1, col=1)
+            if show:
+                fig.add_trace(go.Scatter(x=df["timestamp"], y=df[col], name=name,
+                                          line=dict(color=color, width=1),
+                                          opacity=0.85), row=1, col=1)
 
+        # Order Blocks
         for ob in obs[:60]:
             fc = "rgba(255,75,110,0.10)" if ob["type"] == "bearish" else "rgba(0,212,170,0.10)"
             bc = "#ff4b6e"              if ob["type"] == "bearish" else "#00d4aa"
@@ -1255,6 +1604,7 @@ if run_btn:
                           annotation_font_color=bc, annotation_font_size=8,
                           row=1, col=1)
 
+        # FVGs
         for fvg in fvgs[:40]:
             x0 = df["timestamp"].iloc[fvg["start"]]
             x1 = df["timestamp"].iloc[min(fvg["start"] + 15, len(df) - 1)]
@@ -1265,39 +1615,33 @@ if run_btn:
                           annotation_font_color="#b060ff", annotation_font_size=8,
                           row=1, col=1)
 
+        # Signals
         buys  = df[df["signal"] ==  1]
         sells = df[df["signal"] == -1]
-        fig.add_trace(go.Scatter(
-            x=buys["timestamp"],  y=buys["low"]  * 0.998,
-            mode="markers", name="BUY",
-            marker=dict(symbol="triangle-up", size=9, color="#00d4aa")
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=sells["timestamp"], y=sells["high"] * 1.002,
-            mode="markers", name="EXIT",
-            marker=dict(symbol="triangle-down", size=9, color="#ff4b6e")
-        ), row=1, col=1)
+        fig.add_trace(go.Scatter(x=buys["timestamp"],  y=buys["low"]  * 0.998,
+                                  mode="markers", name="BUY",
+                                  marker=dict(symbol="triangle-up",   size=9, color="#00d4aa")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=sells["timestamp"], y=sells["high"] * 1.002,
+                                  mode="markers", name="EXIT",
+                                  marker=dict(symbol="triangle-down", size=9, color="#ff4b6e")), row=1, col=1)
 
+        # Volume
         vcol = ["#00d4aa" if c >= o else "#ff4b6e"
                 for c, o in zip(df["close"], df["open"])]
-        fig.add_trace(go.Bar(
-            x=df["timestamp"], y=df["volume"],
-            name="Volume", marker_color=vcol, opacity=0.6
-        ), row=2, col=1)
-        fig.add_trace(go.Scatter(
-            x=df["timestamp"], y=df["vol_sma"],
-            name="Vol SMA", line=dict(color="#ff9900", width=1)
-        ), row=2, col=1)
+        fig.add_trace(go.Bar(x=df["timestamp"], y=df["volume"],
+                              name="Volume", marker_color=vcol, opacity=0.6), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=df["vol_sma"],
+                                  name="Vol SMA", line=dict(color="#ff9900", width=1)), row=2, col=1)
 
+        # BSP
         bsp_col = ["#00d4aa" if v > 0 else "#ff4b6e" for v in df["bsp"].fillna(0)]
-        fig.add_trace(go.Bar(
-            x=df["timestamp"], y=df["bsp"],
-            name="BSP", marker_color=bsp_col, opacity=0.85
-        ), row=3, col=1)
+        fig.add_trace(go.Bar(x=df["timestamp"], y=df["bsp"],
+                              name="BSP", marker_color=bsp_col, opacity=0.85), row=3, col=1)
         fig.add_hline(y=bsp_buy_lvl,  line_color="#00d4aa", line_dash="dash", line_width=1, row=3, col=1)
         fig.add_hline(y=bsp_sell_lvl, line_color="#ff4b6e", line_dash="dash", line_width=1, row=3, col=1)
         fig.add_hline(y=0,            line_color="#444",    line_width=1,      row=3, col=1)
 
+        # Option Premium panel
         if trade_options and "opt_price" in df.columns:
             fig.add_trace(go.Scatter(
                 x=df["timestamp"], y=df["opt_price"],
@@ -1305,18 +1649,16 @@ if run_btn:
                 line=dict(color="#d966ff", width=1.5), fill="tozeroy",
                 fillcolor="rgba(150,0,255,0.08)"
             ), row=4, col=1)
-            if "opt_price" in buys.columns:
-                fig.add_trace(go.Scatter(
-                    x=buys["timestamp"], y=buys["opt_price"],
-                    mode="markers", name="Buy Option",
-                    marker=dict(symbol="triangle-up", size=9, color="#00d4aa")
-                ), row=4, col=1)
-            if "opt_price" in sells.columns:
-                fig.add_trace(go.Scatter(
-                    x=sells["timestamp"], y=sells["opt_price"],
-                    mode="markers", name="Exit Option",
-                    marker=dict(symbol="triangle-down", size=9, color="#ff4b6e")
-                ), row=4, col=1)
+            fig.add_trace(go.Scatter(
+                x=buys["timestamp"],  y=buys["opt_price"],
+                mode="markers", name="Buy Option",
+                marker=dict(symbol="triangle-up", size=9, color="#00d4aa")
+            ), row=4, col=1)
+            fig.add_trace(go.Scatter(
+                x=sells["timestamp"], y=sells["opt_price"],
+                mode="markers", name="Exit Option",
+                marker=dict(symbol="triangle-down", size=9, color="#ff4b6e")
+            ), row=4, col=1)
 
         fig.update_layout(
             height=900, template="plotly_dark", showlegend=True,
@@ -1335,38 +1677,52 @@ if run_btn:
         if trades:
             tdf = pd.DataFrame(trades)
 
+            # Round core numeric columns to 2dp
             for col in ["entry_price","exit_price","pnl","return_pct"]:
                 if col in tdf.columns:
                     tdf[col] = tdf[col].round(2)
 
+            # Cumulative P&L
             tdf["cum_pnl"] = tdf["pnl"].cumsum().round(2)
 
+            # Detect leg breakdown columns (leg1_ATM_CALL etc.)
             leg_cols = [c for c in tdf.columns if c.startswith("leg") and "_" in c[3:]]
 
-            all_cols = (["entry_time","exit_time","entry_price","exit_price","qty","lots"]
-                        + leg_cols
-                        + ["pnl","cum_pnl","return_pct","exit_reason"])
+            # Core columns always shown
+            base_cols = ["entry_time","exit_time","entry_price","exit_price",
+                         "qty","lots","pnl","cum_pnl","return_pct","exit_reason"]
+            # Insert leg breakdown after exit_price if present
+            all_cols = ["entry_time","exit_time","entry_price","exit_price",
+                        "qty","lots"] + leg_cols + ["pnl","cum_pnl","return_pct","exit_reason"]
             all_cols = [c for c in all_cols if c in tdf.columns]
 
             rename_map = {
-                "entry_time":  "Entry",  "exit_time":   "Exit",
-                "entry_price": "Net Entry ₹" if leg_cols else "Entry ₹",
-                "exit_price":  "Net Exit ₹"  if leg_cols else "Exit ₹",
-                "qty":         "Qty",    "lots":        "Scale Lots" if leg_cols else "Lots",
-                "pnl":         "Net P&L ₹", "cum_pnl": "Cum. P&L ₹",
-                "return_pct":  "Return %",  "exit_reason": "Reason",
+                "entry_time":  "Entry",   "exit_time":   "Exit",
+                "entry_price": "Net Entry ₹" if len(leg_cols) > 0 else "Entry ₹",
+                "exit_price":  "Net Exit ₹"  if len(leg_cols) > 0 else "Exit ₹",
+                "qty":         "Qty",     "lots":        "Scale Lots" if len(leg_cols) > 0 else "Lots",
+                "pnl":         "Net P&L ₹",  "cum_pnl":     "Cum. P&L ₹",
+                "return_pct":  "Return %",   "exit_reason": "Reason",
             }
+            # Pretty-name leg columns: leg1_ATM+1_CALL → "L1 ATM+1 CE ₹"
             for lc in leg_cols:
-                parts   = lc.split("_", 1)
+                parts = lc.split("_", 1)
                 leg_num = parts[0].replace("leg", "L")
-                rest    = parts[1].replace("_CALL"," CE").replace("_PUT"," PE")
+                rest    = parts[1].replace("_CALL", " CE").replace("_PUT", " PE")
                 rename_map[lc] = f"{leg_num} {rest} ₹"
 
-            display    = tdf[all_cols].rename(columns=rename_map)
+            display = tdf[all_cols].rename(columns=rename_map)
+
+            # All float columns → 2dp format
             float_cols = display.select_dtypes(include="number").columns.tolist()
             fmt_dict   = {c: "{:.2f}" for c in float_cols}
-            color_cols = [rename_map.get(c, c) for c in ["pnl","cum_pnl","return_pct"] + leg_cols
-                          if rename_map.get(c, c) in display.columns]
+
+            # Color: green for positive, red for negative
+            color_cols = [rename_map.get("pnl","Net P&L ₹"),
+                          rename_map.get("cum_pnl","Cum. P&L ₹"),
+                          rename_map.get("return_pct","Return %")]
+            color_cols += [rename_map[lc] for lc in leg_cols if lc in rename_map]
+            color_cols  = [c for c in color_cols if c in display.columns]
 
             styled = display.style.format(fmt_dict).applymap(
                 lambda v: ("color:#00d4aa" if isinstance(v,(int,float)) and v > 0
@@ -1374,24 +1730,33 @@ if run_btn:
                            else ""),
                 subset=color_cols
             )
+
             st.dataframe(styled, use_container_width=True, height=500)
 
+            # Summary bar
+            total_pnl = tdf["pnl"].sum()
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Net P&L",      f"₹{tdf['pnl'].sum():,.2f}")
-            c2.metric("Trades",       len(tdf))
-            c3.metric("Avg P&L",      f"₹{tdf['pnl'].mean():,.2f}")
-            c4.metric("Best Trade",   f"₹{tdf['pnl'].max():,.2f}")
+            c1.metric("Net P&L", f"₹{total_pnl:,.2f}",
+                      delta=f"{'▲' if total_pnl>0 else '▼'} {total_pnl/init_capital*100:.2f}%")
+            c2.metric("Trades",        len(tdf))
+            c3.metric("Avg P&L/Trade", f"₹{tdf['pnl'].mean():,.2f}")
+            c4.metric("Best Trade",    f"₹{tdf['pnl'].max():,.2f}")
 
+            # Leg-level P&L summary for spreads
             if leg_cols:
                 st.markdown("##### 📊 Leg-wise P&L Summary")
-                lc_cols = st.columns(len(leg_cols))
+                leg_summary_cols = st.columns(len(leg_cols))
                 for j, lc in enumerate(leg_cols):
-                    lc_cols[j].metric(rename_map.get(lc, lc), f"₹{tdf[lc].sum():,.2f}")
+                    nice = rename_map.get(lc, lc)
+                    total = tdf[lc].sum()
+                    leg_summary_cols[j].metric(nice, f"₹{total:,.2f}",
+                        delta=f"{'▲' if total>0 else '▼'}")
 
-            st.download_button("⬇️ Download CSV", tdf.to_csv(index=False),
+            csv = tdf.to_csv(index=False)
+            st.download_button("⬇️ Download CSV", csv,
                                f"{index_name}_trades.csv", "text/csv")
         else:
-            st.info("No trades generated. Try adjusting BSP levels or signal mode.")
+            st.info("No trades generated. Try adjusting BSP levels or timeframe.")
 
     # ─ Equity & Drawdown ──────────────────────────────────────────────────────
     with tab3:
@@ -1437,19 +1802,12 @@ if run_btn:
         with c2:
             st.markdown("**Trade Metrics**")
             for k2, v in [
-                ("Total Trades",      m["total_trades"]),
-                ("Win Rate (%)",      f"{m['win_rate']:.1f}%"),
-                ("Profit Factor",     f"{m['profit_factor']:.3f}"),
-                ("Avg Win (₹)",       f"₹{m['avg_win']:,.2f}"),
-                ("Avg Loss (₹)",      f"₹{m['avg_loss']:,.2f}"),
-                ("Max Drawdown (%)",  f"{m['max_drawdown']:.2f}%"),
-            ]:
-                st.markdown(f"`{k2}` &nbsp; **{v}**")
-            st.markdown("**Signal Settings**")
-            for k2, v in [
-                ("Signal Mode",       signal_mode_key),
-                ("BSP Timeframe",     bsp_tf_label),
-                ("EMA Filter",        "ON" if ema_filter else "OFF"),
+                ("Total Trades",     m["total_trades"]),
+                ("Win Rate (%)",     f"{m['win_rate']:.1f}%"),
+                ("Profit Factor",    f"{m['profit_factor']:.3f}"),
+                ("Avg Win (₹)",      f"₹{m['avg_win']:,.2f}"),
+                ("Avg Loss (₹)",     f"₹{m['avg_loss']:,.2f}"),
+                ("Max Drawdown (%)", f"{m['max_drawdown']:.2f}%"),
             ]:
                 st.markdown(f"`{k2}` &nbsp; **{v}**")
 
@@ -1495,10 +1853,6 @@ else:
             <tr>
                 <td style="padding:4px 20px;">✅ BSP + SMC Order Blocks + FVG</td>
                 <td style="padding:4px 20px;">✅ Sharpe · Sortino · Calmar · CAGR</td>
-            </tr>
-            <tr>
-                <td style="padding:4px 20px;">🌲 Pine Exact signal mode (default)</td>
-                <td style="padding:4px 20px;">📅 Daily BSP timeframe (Pine default)</td>
             </tr>
         </table>
     </div>
