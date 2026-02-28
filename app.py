@@ -57,7 +57,7 @@ from dataclasses import dataclass
 @dataclass
 class DhanConfig:
     client_id:    str = "1100480354"
-    access_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMjU3MTI2LCJhcHBfaWQiOiJjOTNkM2UwOSIsImlhdCI6MTc3MjE3MDcyNiwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.kJ6mEUuujMFz8Bte9MCdsg_lF94hTq1xtygSBLzXqhYCb2JfvLbAEYS7pOJtEV424qEgCTg80N4c_a2rRMRRZQ"   # ← paste fresh token here daily
+    access_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMzQ5MzA1LCJhcHBfaWQiOiJjOTNkM2UwOSIsImlhdCI6MTc3MjI2MjkwNSwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.2Gx9EDLxt0avGLTwbu4zriOX03VIwQMAF2xHmC9NzEq6jEkSgMSpGTLNbpOh2ENEU3Rd6TrD5Fcmvsm3Ca0Xkg"   # ← paste fresh token here daily
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
