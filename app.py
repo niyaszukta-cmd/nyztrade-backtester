@@ -1200,7 +1200,7 @@ with st.sidebar:
         eod_exit_time = _dt2.time(int(eod_hour), int(eod_minute))
     else:
         CF_TF = {
-            "5 Min": "5", "15 Min": "15", "25 Min": "25",
+            "1 Min": "1", "5 Min": "5", "15 Min": "15", "25 Min": "25",
             "60 Min": "60", "Daily": "D",
         }
         interval_lbl = st.selectbox("Timeframe", list(CF_TF.keys()), index=4,
