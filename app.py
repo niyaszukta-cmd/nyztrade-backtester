@@ -72,6 +72,134 @@ INDICES = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EXPIRY SCHEDULE — Indian Index Options
+# ══════════════════════════════════════════════════════════════════════════════
+# Each entry:
+#   expiry_type : "weekly" | "monthly"
+#   weekday     : 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri  (for weekly = that weekday)
+#                 For monthly = last occurrence of weekday in month
+#   squareoff   : time to force-close on expiry day (NSE cutoff is 15:20, BSE 15:25)
+#
+# Current schedule (as of 2025-26 SEBI circulars):
+#   NIFTY 50    → Weekly,  every THURSDAY    (moved from Thu; currently Thu as of 2024)
+#   BANKNIFTY   → Monthly, last THURSDAY
+#   FINNIFTY    → Weekly,  every TUESDAY
+#   MIDCPNIFTY  → Monthly, last MONDAY
+#   SENSEX      → Weekly,  every FRIDAY      (BSE)
+#   BANKEX      → Monthly, last FRIDAY       (BSE)
+#
+# NIYAS override:  NIFTY weekly = TUESDAY, BANKNIFTY = month-end THURSDAY
+# (matches the user's specific broker/strategy setup)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import calendar as _calendar
+
+EXPIRY_SCHEDULE = {
+    # index_name : {
+    #   "type"     : "weekly" | "monthly",
+    #   "weekday"  : 0-6 (Monday=0 … Sunday=6),
+    #   "squareoff": datetime.time  — force-close time on expiry day
+    # }
+    "NIFTY 50":   {"type": "weekly",  "weekday": 1,  # Tuesday
+                   "squareoff": __import__("datetime").time(15, 20)},
+    "BANKNIFTY":  {"type": "monthly", "weekday": 3,  # last Thursday of month
+                   "squareoff": __import__("datetime").time(15, 20)},
+    "FINNIFTY":   {"type": "weekly",  "weekday": 1,  # Tuesday
+                   "squareoff": __import__("datetime").time(15, 20)},
+    "MIDCPNIFTY": {"type": "monthly", "weekday": 0,  # last Monday of month
+                   "squareoff": __import__("datetime").time(15, 20)},
+    "SENSEX":     {"type": "weekly",  "weekday": 4,  # Friday  (BSE)
+                   "squareoff": __import__("datetime").time(15, 25)},
+    "BANKEX":     {"type": "monthly", "weekday": 4,  # last Friday of month (BSE)
+                   "squareoff": __import__("datetime").time(15, 25)},
+}
+
+
+def get_weekly_expiry_dates(year: int, month: int, weekday: int) -> list:
+    """Return all dates in (year, month) that fall on `weekday` (Mon=0)."""
+    import datetime as _dt
+    cal   = _calendar.monthcalendar(year, month)
+    dates = []
+    for week in cal:
+        d = week[weekday]
+        if d != 0:
+            dates.append(_dt.date(year, month, d))
+    return dates
+
+
+def get_monthly_expiry_date(year: int, month: int, weekday: int) -> "_dt.date":
+    """Return the LAST occurrence of `weekday` in (year, month)."""
+    import datetime as _dt
+    dates = get_weekly_expiry_dates(year, month, weekday)
+    return dates[-1] if dates else None
+
+
+def get_expiry_dates_in_range(index_name: str,
+                               from_date: "_dt.date",
+                               to_date:   "_dt.date") -> set:
+    """
+    Return a set of all expiry dates for `index_name` between
+    from_date and to_date (inclusive).
+
+    For weekly indices  → every occurrence of the expiry weekday.
+    For monthly indices → last occurrence of expiry weekday each month.
+    """
+    import datetime as _dt
+    schedule = EXPIRY_SCHEDULE.get(index_name)
+    if not schedule:
+        return set()
+
+    expiry_type = schedule["type"]
+    weekday     = schedule["weekday"]
+    result      = set()
+
+    # Iterate month by month across the date range
+    cur_year, cur_month = from_date.year, from_date.month
+    end_year, end_month = to_date.year,   to_date.month
+
+    while (cur_year, cur_month) <= (end_year, end_month):
+        if expiry_type == "weekly":
+            candidates = get_weekly_expiry_dates(cur_year, cur_month, weekday)
+        else:
+            last = get_monthly_expiry_date(cur_year, cur_month, weekday)
+            candidates = [last] if last else []
+
+        for d in candidates:
+            if from_date <= d <= to_date:
+                result.add(d)
+
+        # Advance to next month
+        if cur_month == 12:
+            cur_year  += 1
+            cur_month  = 1
+        else:
+            cur_month += 1
+
+    return result
+
+
+def is_expiry_day(ts, index_name: str, expiry_dates: set) -> bool:
+    """True if ts (datetime or date) falls on a known expiry date."""
+    import datetime as _dt
+    if hasattr(ts, "date"):
+        d = ts.date()
+    elif isinstance(ts, _dt.date):
+        d = ts
+    else:
+        return False
+    return d in expiry_dates
+
+
+def get_expiry_squareoff_time(index_name: str) -> "_dt.time":
+    """Return the expiry-day square-off time for index_name."""
+    import datetime as _dt
+    return EXPIRY_SCHEDULE.get(index_name, {}).get(
+        "squareoff", _dt.time(15, 20)
+    )
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DHAN FETCHER CLASS — mirrors GEX Dashboard's UnifiedOptionsFetcher exactly
 # No token passed anywhere. self.headers used on every request.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -886,7 +1014,9 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
                  fixed_lots: int = None,
                  spread_legs: list = None,
                  is_intraday: bool = False,
-                 eod_exit_time=None) -> tuple[pd.DataFrame, list]:
+                 eod_exit_time=None,
+                 expiry_dates: set = None,
+                 expiry_squareoff_time=None) -> tuple[pd.DataFrame, list]:
     """
     Spread-aware lot-based backtest.
 
@@ -898,8 +1028,11 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
       fixed_lots → that many SCALE lots (each leg uses its own leg["lots"] ratio)
       % of Capital → lots = floor(budget / |spread_cost_per_lot|)
 
-    is_intraday: force-close all positions at eod_exit_time each trading day
-    eod_exit_time: datetime.time object for EOD square-off (default 15:15)
+    is_intraday        : force-close all positions at eod_exit_time each trading day
+    eod_exit_time      : datetime.time object for intraday EOD square-off (default 15:15)
+    expiry_dates       : set of date objects on which expiry square-off must occur
+    expiry_squareoff_time : datetime.time for expiry-day force-close (e.g. 15:20)
+                            Always applied regardless of intraday/carry-forward mode.
     """
     cash, pos_lots, entry_spread, entry_time = capital, 0, 0.0, None
     in_trade = False
@@ -934,6 +1067,10 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
     else:
         _eod_h, _eod_m = 15, 15   # default fallback
 
+    # Resolve expiry-day square-off time
+    _exp_squareoff = expiry_squareoff_time if expiry_squareoff_time is not None else _dt.time(15, 20)
+    _expiry_dates  = expiry_dates if expiry_dates else set()
+
     for row_i, row in df.iterrows():
         sig = row["signal"]
         ts  = row["timestamp"]
@@ -946,14 +1083,53 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
         # Spread price = net debit/credit per scale-lot
         spread_price = float(raw_price)
 
-        # ── INTRADAY EOD FORCE-CLOSE ──────────────────────────────────────
-        # If Intraday mode: square off at/after eod_exit_time on each day
+        # ── EXPIRY-DAY FORCE-CLOSE (always active regardless of intraday flag) ──
+        # On expiry day: close at expiry_squareoff_time (e.g. 15:20 NSE, 15:25 BSE)
+        if in_trade and _expiry_dates:
+            bar_date = ts.date() if hasattr(ts, "date") else None
+            bar_time = ts.time() if hasattr(ts, "time") else None
+            if (bar_date and bar_date in _expiry_dates and
+                    bar_time and bar_time >= _exp_squareoff):
+                eod_spread = spread_price
+                qty        = pos_lots * lot_size
+                pnl        = (eod_spread - entry_spread) * qty - abs(eod_spread) * qty * comm_pct
+                cash      += abs(entry_spread) * qty + pnl
+                trade_rec  = {
+                    "entry_time":  entry_time, "exit_time": ts,
+                    "entry_price": round(entry_spread, 2), "exit_price": round(eod_spread, 2),
+                    "qty": qty, "lots": pos_lots,
+                    "pnl": round(pnl, 2),
+                    "return_pct": round((eod_spread / entry_spread - 1) * 100, 2) if entry_spread != 0 else 0.0,
+                    "exit_reason": "Expiry Square-off",
+                    "strike": row.get("strike", "-"),
+                }
+                if is_spread and spread_legs:
+                    for i, ld in enumerate(spread_legs):
+                        lp_arr = leg_price_series.get(i)
+                        if lp_arr is not None and row_i < len(lp_arr):
+                            try:
+                                eidx = list(df_ts).index(entry_time)
+                                ep = float(lp_arr[eidx]); xp = float(lp_arr[row_i])
+                            except (ValueError, IndexError):
+                                ep = xp = 0.0
+                            sign = 1 if ld["direction"] == "BUY" else -1
+                            trade_rec[f"leg{i+1}_{ld['strike_lbl']}_{ld['opt_type']}"] = round(
+                                sign * (xp - ep) * ld["lots"] * lot_size, 2)
+                trades.append(trade_rec)
+                pos_lots, in_trade = 0, False
+                equities.append(cash)
+                continue  # skip further processing for this bar
+
+        # ── INTRADAY EOD FORCE-CLOSE (only on non-expiry days) ───────────────
         if is_intraday and in_trade:
             bar_time = ts.time() if hasattr(ts, "time") else (
                 _dt.datetime.fromtimestamp(ts.timestamp()).time()
                 if hasattr(ts, "timestamp") else None
             )
-            if bar_time and bar_time >= _dt.time(_eod_h, _eod_m):
+            bar_date_eod = ts.date() if hasattr(ts, "date") else None
+            # Skip if this is already an expiry day (handled above)
+            _already_expiry = bar_date_eod and bar_date_eod in _expiry_dates
+            if bar_time and bar_time >= _dt.time(_eod_h, _eod_m) and not _already_expiry:
                 eod_spread = spread_price
                 qty        = pos_lots * lot_size
                 pnl        = (eod_spread - entry_spread) * qty - abs(eod_spread) * qty * comm_pct
@@ -986,9 +1162,12 @@ def run_backtest(df: pd.DataFrame, capital: float, size_pct: float,
 
         # ── ENTRY — trigger on BUY signal (or SELL signal for short legs) ──
         # Entry fires on sig==1 (long) or sig==-1 when no position open
-        # In Intraday mode: block new entries after EOD time
+        # Block new entries after EOD / expiry squareoff time
         _bar_time_now = ts.time() if hasattr(ts, "time") else None
-        _block_entry  = is_intraday and _bar_time_now and _bar_time_now >= _dt.time(_eod_h, _eod_m)
+        _bar_date_now = ts.date() if hasattr(ts, "date") else None
+        _on_expiry    = _bar_date_now and _bar_date_now in _expiry_dates
+        _after_exp_so = _on_expiry and _bar_time_now and _bar_time_now >= _exp_squareoff
+        _block_entry  = _after_exp_so or (is_intraday and _bar_time_now and _bar_time_now >= _dt.time(_eod_h, _eod_m))
         entry_triggered = (sig == 1 and not in_trade and not _block_entry)
 
         if entry_triggered:
@@ -1107,7 +1286,9 @@ def run_backtest_dual(
     bsp_length: int, signal_mode: str, ema_filter: bool,
     fixed_lots: int = None,
     is_intraday: bool = False,
-    eod_exit_time=None
+    eod_exit_time=None,
+    expiry_dates: set = None,
+    expiry_squareoff_time=None,
 ) -> tuple[pd.DataFrame, list]:
     """
     Strike-chart dual backtest.
@@ -1116,6 +1297,7 @@ def run_backtest_dual(
     - CE signal fires CE BUY trade (buy call when CE OI+Vol momentum is bullish)
     - PE signal fires PE BUY trade (buy put when PE OI+Vol momentum is bullish)
     - Both legs tracked independently; combined equity curve returned.
+    - expiry_dates: set of date objects — positions force-closed at expiry_squareoff_time
     """
     import datetime as _dt
 
@@ -1139,6 +1321,9 @@ def run_backtest_dual(
         _eod_h, _eod_m = eod_exit_time.hour, eod_exit_time.minute
     else:
         _eod_h, _eod_m = 15, 15
+
+    _exp_squareoff = expiry_squareoff_time if expiry_squareoff_time is not None else _dt.time(15, 20)
+    _expiry_dates  = expiry_dates if expiry_dates else set()
 
     cash = capital
     equities, trades = [], []
@@ -1166,7 +1351,15 @@ def run_backtest_dual(
         pe_price = float(pe_row["close"]) if pe_row is not None and pd.notna(pe_row.get("close")) else None
 
         bar_time = ts.time() if hasattr(ts, "time") else None
-        is_eod   = bar_time and bar_time >= _dt.time(_eod_h, _eod_m) if is_intraday else False
+        bar_date = ts.date() if hasattr(ts, "date") else None
+        _on_expiry   = bar_date and bar_date in _expiry_dates
+        # Expiry square-off: always fires on expiry day at/after expiry_squareoff_time
+        is_expiry_so = _on_expiry and bar_time and bar_time >= _exp_squareoff
+        # Regular EOD: intraday non-expiry days only
+        is_eod       = (not _on_expiry and is_intraday and
+                        bar_time and bar_time >= _dt.time(_eod_h, _eod_m))
+        # Combined: close if either condition
+        should_close = is_expiry_so or is_eod
 
         def _exit(in_trade, lots, entry_price, entry_time, price, reason, leg):
             nonlocal cash
@@ -1188,9 +1381,10 @@ def run_backtest_dual(
 
         # ── CE leg ──────────────────────────────────────────────────────────
         if ce_price is not None:
-            if is_eod and ce_in_trade:
+            if should_close and ce_in_trade:
+                _reason = "Expiry Square-off" if is_expiry_so else "EOD"
                 ce_in_trade, ce_lots, ce_entry_price, ce_entry_time = _exit(
-                    ce_in_trade, ce_lots, ce_entry_price, ce_entry_time, ce_price, "EOD", "CE")
+                    ce_in_trade, ce_lots, ce_entry_price, ce_entry_time, ce_price, _reason, "CE")
             elif ce_sig == 1 and not ce_in_trade:
                 n = _lots(ce_price)
                 if n > 0:
@@ -1205,9 +1399,10 @@ def run_backtest_dual(
 
         # ── PE leg ──────────────────────────────────────────────────────────
         if pe_price is not None:
-            if is_eod and pe_in_trade:
+            if should_close and pe_in_trade:
+                _reason = "Expiry Square-off" if is_expiry_so else "EOD"
                 pe_in_trade, pe_lots, pe_entry_price, pe_entry_time = _exit(
-                    pe_in_trade, pe_lots, pe_entry_price, pe_entry_time, pe_price, "EOD", "PE")
+                    pe_in_trade, pe_lots, pe_entry_price, pe_entry_time, pe_price, _reason, "PE")
             elif pe_sig == 1 and not pe_in_trade:
                 n = _lots(pe_price)
                 if n > 0:
@@ -1245,6 +1440,8 @@ def run_backtest_alternating(
     fixed_lots: int = None,
     is_intraday: bool = False,
     eod_exit_time=None,
+    expiry_dates: set = None,
+    expiry_squareoff_time=None,
 ) -> tuple[pd.DataFrame, list]:
     """
     CE/PE Alternating State Machine — mirrors Pine Script logic exactly:
@@ -1259,6 +1456,9 @@ def run_backtest_alternating(
 
     ce_df / pe_df: raw option OHLCV (close = premium price per unit)
     Both are aligned to df index by timestamp.
+
+    expiry_dates       : set of date objects for expiry-day force-close
+    expiry_squareoff_time : time to close on expiry day (e.g. 15:20)
 
     Returns (results DataFrame with equity curve, trades list).
     Each trade dict carries 'leg' = 'CE' or 'PE'.
@@ -1286,6 +1486,9 @@ def run_backtest_alternating(
         _eod_h, _eod_m = eod_exit_time.hour, eod_exit_time.minute
     else:
         _eod_h, _eod_m = 15, 15
+
+    _exp_squareoff = expiry_squareoff_time if expiry_squareoff_time is not None else _dt.time(15, 20)
+    _expiry_dates  = expiry_dates if expiry_dates else set()
 
     def _calc_lots(price: float) -> int:
         if price <= 0:
@@ -1342,10 +1545,24 @@ def run_backtest_alternating(
         ce_p = ce_price_s.iloc[row_i] if row_i < len(ce_price_s) else np.nan
         pe_p = pe_price_s.iloc[row_i] if row_i < len(pe_price_s) else np.nan
 
-        # ── EOD force-close ───────────────────────────────────────────────────
+        # ── EXPIRY-DAY FORCE-CLOSE (always, regardless of intraday flag) ────────
+        if active_leg != 0 and _expiry_dates:
+            bar_date_x = ts.date() if hasattr(ts, "date") else None
+            bar_time_x = ts.time() if hasattr(ts, "time") else None
+            if (bar_date_x and bar_date_x in _expiry_dates and
+                    bar_time_x and bar_time_x >= _exp_squareoff):
+                _exp_p = ce_p if active_leg == 1 else pe_p
+                if not np.isnan(_exp_p):
+                    _close_position(_exp_p, ts, "Expiry Square-off")
+                    equities.append(cash)
+                    continue
+
+        # ── INTRADAY EOD FORCE-CLOSE (non-expiry days only) ──────────────────
         if is_intraday and active_leg != 0:
-            bar_time = ts.time() if hasattr(ts, "time") else None
-            if bar_time and bar_time >= _dt.time(_eod_h, _eod_m):
+            bar_date_eod = ts.date() if hasattr(ts, "date") else None
+            bar_time     = ts.time() if hasattr(ts, "time") else None
+            _on_exp_day  = bar_date_eod and bar_date_eod in _expiry_dates
+            if bar_time and bar_time >= _dt.time(_eod_h, _eod_m) and not _on_exp_day:
                 eod_p = ce_p if active_leg == 1 else pe_p
                 if not np.isnan(eod_p):
                     _close_position(eod_p, ts, "EOD Square-off")
@@ -1469,6 +1686,18 @@ with st.sidebar:
     strike_gap = idx_cfg["strike_gap"]
 
     st.caption(f"Lot Size: **{lot_size}** | Strike Gap: **{strike_gap}**")
+
+    # ── Expiry schedule info ──────────────────────────────────────────────────
+    _exp_sch = EXPIRY_SCHEDULE.get(index_name, {})
+    if _exp_sch:
+        _exp_type = _exp_sch["type"].capitalize()
+        _wd_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+        _exp_day  = _wd_names[_exp_sch["weekday"]]
+        _exp_so   = _exp_sch["squareoff"].strftime("%H:%M")
+        _exp_desc = (f"Weekly · every **{_exp_day}**"
+                     if _exp_sch["type"] == "weekly"
+                     else f"Monthly · last **{_exp_day}** of month")
+        st.caption(f"📅 Expiry: {_exp_desc} · Square-off: **{_exp_so}** IST")
 
     # ── Trade Style ────────────────────────────────────────────────────────
     trade_style = st.radio(
@@ -1950,8 +2179,52 @@ with page_tab2:
             else:
                 _algo_log(f"Option LTP: ₹{opt_ltp:.2f}", "info")
 
+            # ── Check expiry-day conditions ───────────────────────────────────
+            import datetime as _dt_algo
+            _today          = _dt_algo.date.today()
+            _algo_exp_dates = get_expiry_dates_in_range(algo_index, _today, _today)
+            _algo_exp_so    = get_expiry_squareoff_time(algo_index)
+            _now_time       = _dt_algo.datetime.now().time()
+            _is_expiry_today = _today in _algo_exp_dates
+            _past_exp_so     = _is_expiry_today and _now_time >= _algo_exp_so
+
+            # Force-close on expiry day at/after squareoff time
+            if _is_expiry_today and _past_exp_so and state["active_leg"] != 0:
+                _exp_leg = "CE" if state["active_leg"] == 1 else "PUT"
+                _exp_opt_ltp = fetch_live_option_ltp(
+                    algo_idx["security_id"], algo_strike_offset,
+                    "CALL" if state["active_leg"] == 1 else "PUT", algo_expiry
+                )
+                if _exp_opt_ltp and _exp_opt_ltp > 0:
+                    _exp_qty = state["n_lots"] * algo_idx["lot_size"]
+                    _exp_pnl = (_exp_opt_ltp - state["entry_price"]) * _exp_qty
+                    state["paper_pnl"] += _exp_pnl
+                    state["cash"] += state["entry_price"] * _exp_qty + _exp_pnl
+                    _algo_log(
+                        f"EXPIRY SQUARE-OFF {_exp_leg} @ {_exp_opt_ltp:.2f} "
+                        f"[{index_name} expiry day {_today}] | P&L ₹{_exp_pnl:+,.2f}",
+                        "warn"
+                    )
+                    st.session_state[ALGO_TRADES_KEY].append({
+                        "time": _dt_algo.datetime.now().strftime("%H:%M:%S"),
+                        "leg": _exp_leg, "action": "EXPIRY CLOSE",
+                        "price": round(_exp_opt_ltp, 2), "lots": state["n_lots"],
+                        "pnl": round(_exp_pnl, 2),
+                        "mode": "Paper" if not is_live else "Live"
+                    })
+                    state.update({"active_leg": 0, "entry_price": 0.0,
+                                  "entry_time": None, "dhan_order_id": None})
+                    st.warning(
+                        f"⚠️ **Expiry Square-off triggered** — {algo_index} expires today "
+                        f"({_today}). Position closed at {_algo_exp_so.strftime('%H:%M')} IST."
+                    )
+                    st.rerun()
+
+            # Block new entries after expiry squareoff on expiry day
+            _block_new_entry = _past_exp_so
+
             # Execute trade
-            if signal != 0:
+            if signal != 0 and not _block_new_entry:
                 if not is_live:
                     # ── PAPER MODE ─────────────────────────────────────────────
                     if state["cash"] <= 0:
@@ -2317,6 +2590,12 @@ if run_btn:
         st.success(f"✅ CE: **{len(ce_raw):,} bars** | PE: **{len(pe_raw):,} bars**")
 
         # ── 4. Run alternating backtest ────────────────────────────────────────
+        # Compute expiry dates for this index + date range
+        _alt_expiry_dates = get_expiry_dates_in_range(
+            index_name, from_date, to_date
+        )
+        _alt_exp_so_time  = get_expiry_squareoff_time(index_name)
+
         with st.spinner("📊 Running CE/PE alternating backtest…"):
             results, trades = run_backtest_alternating(
                 df, ce_raw, pe_raw,
@@ -2327,6 +2606,8 @@ if run_btn:
                 fixed_lots=fixed_lots,
                 is_intraday=is_intraday,
                 eod_exit_time=eod_exit_time,
+                expiry_dates=_alt_expiry_dates,
+                expiry_squareoff_time=_alt_exp_so_time,
             )
             m = metrics(results, trades, init_capital)
 
@@ -2639,6 +2920,12 @@ if run_btn:
             c3.metric("PE BSP Min", round(float(_pe_bsp.min()), 4))
             c4.metric("PE BSP Max", round(float(_pe_bsp.max()), 4))
 
+        # Compute expiry dates for Strike Chart mode
+        _sc_expiry_dates = get_expiry_dates_in_range(
+            index_name, from_date, to_date
+        )
+        _sc_exp_so_time  = get_expiry_squareoff_time(index_name)
+
         with st.spinner("📊 Running dual-strike backtest…"):
             results, trades = run_backtest_dual(
                 ce_raw, pe_raw,
@@ -2652,7 +2939,9 @@ if run_btn:
                 ema_filter=ema_filter,
                 fixed_lots=int(sc_lots),
                 is_intraday=is_intraday,
-                eod_exit_time=eod_exit_time
+                eod_exit_time=eod_exit_time,
+                expiry_dates=_sc_expiry_dates,
+                expiry_squareoff_time=_sc_exp_so_time,
             )
             m = metrics(results, trades, init_capital)
 
@@ -2856,6 +3145,10 @@ if run_btn:
             ).ffill().fillna(0).values
 
     # ── 4. Run Backtest ───────────────────────────────────────────────────────
+    # Compute expiry dates for standard mode
+    _std_expiry_dates = get_expiry_dates_in_range(index_name, from_date, to_date)
+    _std_exp_so_time  = get_expiry_squareoff_time(index_name)
+
     with st.spinner("📊 Running backtest…"):
         results, trades = run_backtest(
             df, init_capital, pos_size_pct / 100,
@@ -2863,7 +3156,9 @@ if run_btn:
             fixed_lots=fixed_lots,
             spread_legs=leg_dfs if trade_options else None,
             is_intraday=is_intraday,
-            eod_exit_time=eod_exit_time
+            eod_exit_time=eod_exit_time,
+            expiry_dates=_std_expiry_dates,
+            expiry_squareoff_time=_std_exp_so_time,
         )
         m = metrics(results, trades, init_capital)
 
