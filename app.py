@@ -57,7 +57,7 @@ from dataclasses import dataclass
 @dataclass
 class DhanConfig:
     client_id:    str = "1100480354"
-    access_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMzQ5MzA1LCJhcHBfaWQiOiJjOTNkM2UwOSIsImlhdCI6MTc3MjI2MjkwNSwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.2Gx9EDLxt0avGLTwbu4zriOX03VIwQMAF2xHmC9NzEq6jEkSgMSpGTLNbpOh2ENEU3Rd6TrD5Fcmvsm3Ca0Xkg"   # ← paste fresh token here daily
+    access_token: str = "paste_your_token_here"   # ← paste fresh token here daily
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
@@ -287,6 +287,303 @@ class DhanFetcher:
 
 # Module-level fetcher instance — uses hardcoded DhanConfig
 _fetcher = DhanFetcher(DhanConfig())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALGO DEPLOYMENT ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+import json, threading, queue
+import datetime as _dt
+
+# ── NSE FNO security-id lookup for Dhan order placement ──────────────────────
+# These are the *index option* security IDs used in rollingoption charts.
+# For order placement Dhan requires the exact contract security_id from the
+# scripmaster CSV — we store ATM placeholder IDs per index.
+# The live engine resolves the real contract ID dynamically via the quote API.
+INDEX_OPTION_EXCHANGE = {
+    "NIFTY 50":   "NSE_FNO",
+    "BANKNIFTY":  "NSE_FNO",
+    "FINNIFTY":   "NSE_FNO",
+    "MIDCPNIFTY": "NSE_FNO",
+    "SENSEX":     "BSE_FNO",
+    "BANKEX":     "BSE_FNO",
+}
+
+# ── Session state keys ────────────────────────────────────────────────────────
+ALGO_STATE_KEY  = "algo_state"
+ALGO_LOG_KEY    = "algo_log"
+ALGO_TRADES_KEY = "algo_trades"
+ALGO_POS_KEY    = "algo_position"
+
+def _algo_init_state():
+    """Initialise algo session state if not already present."""
+    if ALGO_STATE_KEY not in st.session_state:
+        st.session_state[ALGO_STATE_KEY] = {
+            "running":      False,
+            "mode":         "paper",   # "paper" | "live"
+            "active_leg":   0,         # 0=flat, 1=CE open, -1=PE open
+            "entry_price":  0.0,
+            "entry_time":   None,
+            "n_lots":       1,
+            "capital":      500_000.0,
+            "cash":         500_000.0,
+            "last_signal":  0,
+            "last_price":   0.0,
+            "last_refresh": None,
+            "dhan_order_id": None,
+            "paper_pnl":    0.0,
+        }
+    if ALGO_LOG_KEY not in st.session_state:
+        st.session_state[ALGO_LOG_KEY] = []
+    if ALGO_TRADES_KEY not in st.session_state:
+        st.session_state[ALGO_TRADES_KEY] = []
+    if ALGO_POS_KEY not in st.session_state:
+        st.session_state[ALGO_POS_KEY] = {}
+
+
+def _algo_log(msg: str, level: str = "info"):
+    """Append timestamped entry to algo log."""
+    ts  = _dt.datetime.now().strftime("%H:%M:%S")
+    ico = {"info": "ℹ️", "buy": "🟢", "sell": "🔴", "warn": "⚠️",
+           "error": "❌", "paper": "📋", "order": "📤"}.get(level, "•")
+    st.session_state[ALGO_LOG_KEY].append(f"{ts}  {ico}  {msg}")
+    # Keep last 200 log lines
+    if len(st.session_state[ALGO_LOG_KEY]) > 200:
+        st.session_state[ALGO_LOG_KEY] = st.session_state[ALGO_LOG_KEY][-200:]
+
+
+# ── Live quote fetch ──────────────────────────────────────────────────────────
+def fetch_live_ltp(security_id: int, exchange: str = "IDX_I") -> float | None:
+    """
+    Fetch last traded price via Dhan Market Quote API.
+    POST /marketfeed/ltp
+    """
+    cfg = DhanConfig()
+    headers = {
+        "access-token": cfg.access_token,
+        "client-id":    cfg.client_id,
+        "Content-Type": "application/json",
+    }
+    payload = {exchange: [str(security_id)]}
+    try:
+        r = requests.post(f"{DHAN_BASE}/marketfeed/ltp",
+                          headers=headers, json=payload, timeout=8)
+        if r.ok:
+            data = r.json().get("data", {}).get(exchange, {})
+            entry = data.get(str(security_id), {})
+            return float(entry.get("last_price", 0)) or None
+        return None
+    except Exception:
+        return None
+
+
+def fetch_live_option_ltp(security_id: int, offset: int,
+                           opt_type: str, expiry_flag: str = "WEEK") -> float | None:
+    """
+    Fetch LTP of a rolling ATM option via the rollingoption quote endpoint.
+    Falls back to a 1-bar fetch of the latest candle.
+    """
+    cfg = DhanConfig()
+    headers = {
+        "access-token": cfg.access_token,
+        "client-id":    cfg.client_id,
+        "Content-Type": "application/json",
+    }
+    strike_str = "ATM" if offset == 0 else (
+        f"ATM+{offset}" if offset > 0 else f"ATM{offset}"
+    )
+    key = "ce" if opt_type == "CALL" else "pe"
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    payload = {
+        "exchangeSegment": "NSE_FNO",
+        "interval":        "1",
+        "securityId":      security_id,
+        "instrument":      "OPTIDX",
+        "expiryFlag":      expiry_flag,
+        "expiryCode":      1,
+        "strike":          strike_str,
+        "drvOptionType":   opt_type,
+        "requiredData":    ["close"],
+        "fromDate":        today,
+        "toDate":          today,
+    }
+    try:
+        r = requests.post(f"{DHAN_BASE}/charts/rollingoption",
+                          headers=headers, json=payload, timeout=10)
+        if r.ok:
+            raw = r.json().get("data", {}).get(key, {})
+            closes = raw.get("close", [])
+            if closes:
+                return float(closes[-1])
+        return None
+    except Exception:
+        return None
+
+
+# ── Dhan Order Placement ──────────────────────────────────────────────────────
+def place_dhan_order(
+    security_id: str,
+    exchange_segment: str,      # "NSE_FNO" / "BSE_FNO"
+    transaction_type: str,      # "BUY" / "SELL"
+    quantity: int,
+    order_type: str = "MARKET",
+    product_type: str = "INTRADAY",
+    price: float = 0.0,
+    trigger_price: float = 0.0,
+    remarks: str = "NYZTrade-Algo",
+) -> dict:
+    """
+    Place order via Dhan v2 /orders endpoint.
+    Returns {"order_id": ..., "status": ..., "raw": ...}
+    """
+    cfg = DhanConfig()
+    headers = {
+        "access-token": cfg.access_token,
+        "client-id":    cfg.client_id,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "dhanClientId":     cfg.client_id,
+        "correlationId":    f"nyztrade_{int(time.time())}",
+        "transactionType":  transaction_type,
+        "exchangeSegment":  exchange_segment,
+        "productType":      product_type,
+        "orderType":        order_type,
+        "validity":         "DAY",
+        "tradingSymbol":    "",          # Dhan resolves from securityId
+        "securityId":       str(security_id),
+        "quantity":         quantity,
+        "disclosedQuantity": 0,
+        "price":            price,
+        "triggerPrice":     trigger_price,
+        "afterMarketOrder": False,
+        "remarks":          remarks,
+    }
+    try:
+        r = requests.post(f"{DHAN_BASE}/orders",
+                          headers=headers, json=payload, timeout=15)
+        body = r.json()
+        if r.ok:
+            return {"ok": True,
+                    "order_id": body.get("orderId", body.get("order_id", "?")),
+                    "status":   body.get("orderStatus", "PLACED"),
+                    "raw":      body}
+        return {"ok": False, "error": body.get("errorCode",""), "raw": body}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "raw": {}}
+
+
+# ── Compute current live signal ───────────────────────────────────────────────
+def compute_live_signal(
+    index_security_id: int,
+    interval: str,
+    bsp_length: int,
+    bsp_buy_lvl: float,
+    bsp_sell_lvl: float,
+    signal_mode: str,
+    ema_filter: bool,
+) -> tuple[int, float, float]:
+    """
+    Fetch last N candles, recompute BSP + EMAs, return (signal, bsp, close).
+    Returns (signal, bsp_val, close_price)
+    signal: 1 = BUY, -1 = SELL, 0 = NEUTRAL
+    """
+    today  = _dt.date.today()
+    # For intraday signals use last 3 days of data (ensures enough bars)
+    fd = (today - _dt.timedelta(days=5)).strftime("%Y-%m-%d")
+    td = today.strftime("%Y-%m-%d")
+
+    df = _fetcher.fetch_index_ohlcv(
+        index_security_id, fd, td,
+        interval=interval if interval != "D" else "25",
+        debug=False
+    )
+    if df is None or df.empty or len(df) < max(bsp_length + 5, 30):
+        return 0, 0.0, 0.0
+
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    df["bsp"]   = calc_bsp(df, bsp_length)
+    df = generate_signals(df, bsp_buy_lvl, bsp_sell_lvl,
+                          ema_filter=ema_filter, signal_mode=signal_mode)
+
+    last = df.iloc[-1]
+    return int(last["signal"]), round(float(last["bsp"]), 4), round(float(last["close"]), 2)
+
+
+# ── Paper trade executor ──────────────────────────────────────────────────────
+def paper_execute(
+    signal: int, opt_price: float, lot_size: int,
+    lots: int, comm_pct: float,
+    state: dict
+):
+    """
+    Execute paper trade based on signal vs current active_leg.
+    Mutates state dict in-place.
+    """
+    active = state["active_leg"]
+    cash   = state["cash"]
+
+    if signal == 1 and active != 1:
+        # Close PE if open
+        if active == -1 and state["entry_price"] > 0 and opt_price > 0:
+            qty    = lots * lot_size
+            pnl    = (opt_price - state["entry_price"]) * qty - abs(opt_price) * qty * comm_pct
+            cash  += abs(state["entry_price"]) * qty + pnl
+            state["paper_pnl"] += pnl
+            _algo_log(f"PAPER CLOSE PE @ {opt_price:.2f} | P&L ₹{pnl:+,.2f}", "sell")
+            st.session_state[ALGO_TRADES_KEY].append({
+                "time": _dt.datetime.now().strftime("%H:%M:%S"),
+                "leg": "PE", "action": "CLOSE",
+                "price": round(opt_price, 2), "lots": lots,
+                "pnl": round(pnl, 2), "mode": "Paper"
+            })
+        # Open CE
+        cost = abs(opt_price) * lots * lot_size * (1 + comm_pct)
+        if cash >= cost and opt_price > 0:
+            cash -= cost
+            state.update({"active_leg": 1, "entry_price": opt_price,
+                           "entry_time": _dt.datetime.now().isoformat(),
+                           "n_lots": lots, "cash": cash})
+            _algo_log(f"PAPER BUY CE @ {opt_price:.2f} | {lots} lot(s)", "buy")
+            st.session_state[ALGO_TRADES_KEY].append({
+                "time": _dt.datetime.now().strftime("%H:%M:%S"),
+                "leg": "CE", "action": "BUY",
+                "price": round(opt_price, 2), "lots": lots,
+                "pnl": 0.0, "mode": "Paper"
+            })
+
+    elif signal == -1 and active != -1:
+        # Close CE if open
+        if active == 1 and state["entry_price"] > 0 and opt_price > 0:
+            qty    = lots * lot_size
+            pnl    = (opt_price - state["entry_price"]) * qty - abs(opt_price) * qty * comm_pct
+            cash  += abs(state["entry_price"]) * qty + pnl
+            state["paper_pnl"] += pnl
+            _algo_log(f"PAPER CLOSE CE @ {opt_price:.2f} | P&L ₹{pnl:+,.2f}", "buy")
+            st.session_state[ALGO_TRADES_KEY].append({
+                "time": _dt.datetime.now().strftime("%H:%M:%S"),
+                "leg": "CE", "action": "CLOSE",
+                "price": round(opt_price, 2), "lots": lots,
+                "pnl": round(pnl, 2), "mode": "Paper"
+            })
+        # Open PE
+        cost = abs(opt_price) * lots * lot_size * (1 + comm_pct)
+        if cash >= cost and opt_price > 0:
+            cash -= cost
+            state.update({"active_leg": -1, "entry_price": opt_price,
+                           "entry_time": _dt.datetime.now().isoformat(),
+                           "n_lots": lots, "cash": cash})
+            _algo_log(f"PAPER BUY PE @ {opt_price:.2f} | {lots} lot(s)", "sell")
+            st.session_state[ALGO_TRADES_KEY].append({
+                "time": _dt.datetime.now().strftime("%H:%M:%S"),
+                "leg": "PE", "action": "BUY",
+                "price": round(opt_price, 2), "lots": lots,
+                "pnl": 0.0, "mode": "Paper"
+            })
+
+    state["cash"] = cash
+
 
 
 def _parse_ohlcv(data: dict) -> pd.DataFrame | None:
@@ -1439,14 +1736,514 @@ with st.sidebar:
 # HEADER
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.markdown(f"## 📡 NYZTrade · SMC Liquidity Lens — Index Backtest")
+st.markdown("## 📡 NYZTrade · SMC Liquidity Lens")
 st.caption("Smart Money Concepts + BSP Oscillator + FVG | Indian Indices | Dhan API")
-st.divider()
+
+# ── TOP-LEVEL PAGE NAVIGATION ────────────────────────────────────────────────
+page_tab1, page_tab2 = st.tabs(["📊 Backtester", "🤖 Algo Deployment"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALGO DEPLOYMENT PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+with page_tab2:
+    _algo_init_state()
+    state = st.session_state[ALGO_STATE_KEY]
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown("### 🤖 Algo Deployment — CE/PE Alternating Strategy")
+    st.caption("Deploy the SMC BSP CE/PE alternating strategy live or in paper mode via Dhan API")
+
+    cfg_check = DhanConfig()
+    if cfg_check.access_token == "paste_your_token_here":
+        st.error("❌ Token not configured. Update `access_token` in DhanConfig before deploying.")
+    else:
+        st.success(f"✅ Token configured · Client: `{cfg_check.client_id}`")
+
+    st.divider()
+
+    # ── Two columns: Controls | Status ────────────────────────────────────────
+    algo_col1, algo_col2 = st.columns([1, 1.6], gap="large")
+
+    with algo_col1:
+        st.markdown("#### ⚙️ Deployment Settings")
+
+        # Trading Mode
+        algo_trade_mode = st.radio(
+            "Trading Mode",
+            ["📋 Paper Trading", "💰 Real Trading"],
+            index=0,
+            help=(
+                "Paper Trading: All signals are simulated. No real orders placed. "
+                "Tracks virtual P&L in session.\n\n"
+                "Real Trading: Orders placed via Dhan API. Real money at risk."
+            )
+        )
+        is_live = algo_trade_mode == "💰 Real Trading"
+
+        if is_live:
+            st.warning(
+                "⚠️ **REAL MONEY MODE**\n\n"
+                "Orders will be placed via your Dhan account. "
+                "Ensure your token is valid and you have sufficient margin. "
+                "NYZTrade is not responsible for trading losses.",
+                icon="🚨"
+            )
+
+        st.markdown("---")
+
+        # Index & contract settings
+        algo_index = st.selectbox("Index", list(INDICES.keys()), key="algo_index")
+        algo_idx   = INDICES[algo_index]
+
+        algo_expiry = st.radio("Expiry", ["WEEK", "MONTH"], horizontal=True, key="algo_expiry")
+        _aoff_opts   = list(range(-5, 6))
+        _aoff_labels = ["ATM" if o == 0 else (f"ATM+{o}" if o > 0 else f"ATM{o}") for o in _aoff_opts]
+        algo_strike_lbl = st.select_slider(
+            "Strike", options=_aoff_labels, value="ATM", key="algo_strike"
+        )
+        algo_strike_offset = _aoff_opts[_aoff_labels.index(algo_strike_lbl)]
+
+        # Timeframe for signal computation
+        algo_tf_map = {"1 Min":"1","3 Min":"3","5 Min":"5","15 Min":"15","25 Min":"25","60 Min":"60"}
+        algo_tf_lbl = st.selectbox("Signal Timeframe", list(algo_tf_map.keys()), index=3, key="algo_tf")
+        algo_tf     = algo_tf_map[algo_tf_lbl]
+
+        # Refresh interval
+        algo_refresh = st.selectbox(
+            "Auto-Refresh Every",
+            ["Off (Manual)", "30 seconds", "1 minute", "2 minutes", "5 minutes"],
+            index=2,
+            help="How often to re-compute signal and check for trade triggers."
+        )
+
+        st.markdown("---")
+
+        # Strategy parameters
+        st.markdown("**Strategy Parameters**")
+        algo_bsp_len   = st.slider("BSP Length",    5, 50, 21, key="algo_bsp_len")
+        algo_buy_lvl   = st.number_input("BSP Buy Level",  value=0.08,  step=0.01, format="%.2f", key="algo_buy")
+        algo_sell_lvl  = st.number_input("BSP Sell Level", value=-0.08, step=0.01, format="%.2f", key="algo_sell")
+        algo_sig_mode  = st.selectbox("Signal Mode",
+                                       ["Flip","Level Hold","BSP Only"],
+                                       index=1, key="algo_sigmode")
+        algo_ema_filter = st.checkbox("EMA Trend Filter", value=True, key="algo_ema")
+
+        st.markdown("---")
+
+        # Position sizing
+        st.markdown("**Position Sizing**")
+        algo_lots     = st.number_input("Lots per Trade", min_value=1, max_value=50, value=1, key="algo_lots")
+        algo_comm     = st.number_input("Commission (%)", value=0.03, step=0.01, format="%.3f", key="algo_comm")
+        algo_capital  = st.number_input("Virtual Capital (₹)", value=500_000, step=50_000, key="algo_cap",
+                                         help="Used for paper trading P&L tracking only.")
+
+        if is_live:
+            algo_product = st.radio(
+                "Product Type",
+                ["INTRADAY (MIS)", "DELIVERY (NRML)"],
+                horizontal=True,
+                help="INTRADAY: auto-squared off by broker at 3:20 PM. NRML: held overnight.",
+                key="algo_product"
+            )
+            algo_product_type = "INTRADAY" if "INTRADAY" in algo_product else "DELIVERY"
+        else:
+            algo_product_type = "INTRADAY"
+
+        st.markdown("---")
+
+        # EOD square-off
+        algo_eod_squareoff = st.checkbox(
+            "EOD Square-off",
+            value=True,
+            help="Automatically close open position at market close (3:15 PM IST).",
+            key="algo_eod"
+        )
+
+    # ── Right column: Status, Signal Monitor, Log ─────────────────────────────
+    with algo_col2:
+        st.markdown("#### 📡 Live Status")
+
+        # Status cards
+        s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+        _leg_label = {"0": "FLAT", "1": "CE OPEN", "-1": "PE OPEN"}.get(
+            str(state["active_leg"]), "FLAT"
+        )
+        _leg_color = "#00d4aa" if state["active_leg"] == 1 else (
+                     "#ff4b6e" if state["active_leg"] == -1 else "#888"
+        )
+        s_c1.markdown(
+            f"<div style='background:#1a1d29;border-radius:8px;padding:10px;text-align:center;"
+            f"border:1px solid {_leg_color}'>"
+            f"<div style='font-size:0.7rem;color:#888'>ACTIVE LEG</div>"
+            f"<div style='font-size:1.3rem;color:{_leg_color};font-weight:700'>{_leg_label}</div>"
+            f"</div>", unsafe_allow_html=True
+        )
+        s_c2.metric("Entry Price",
+                    f"₹{state['entry_price']:,.2f}" if state["active_leg"] != 0 else "—")
+        s_c3.metric("Session P&L",
+                    f"₹{state['paper_pnl']:+,.2f}",
+                    delta=f"{'▲' if state['paper_pnl']>=0 else '▼'}")
+        s_c4.metric("Cash",
+                    f"₹{state['cash']:,.0f}")
+
+        st.markdown("")
+
+        # ── Signal Monitor ────────────────────────────────────────────────────
+        st.markdown("#### 🔍 Signal Monitor")
+
+        sig_col1, sig_col2 = st.columns([2, 1])
+        with sig_col1:
+            fetch_signal_btn = st.button(
+                "🔄 Fetch Live Signal", type="primary",
+                key="fetch_signal",
+                use_container_width=True
+            )
+        with sig_col2:
+            reset_btn = st.button(
+                "🔁 Reset Session",
+                key="reset_algo",
+                use_container_width=True
+            )
+
+        if reset_btn:
+            # Reset all algo state
+            state.update({
+                "running": False, "active_leg": 0,
+                "entry_price": 0.0, "entry_time": None,
+                "cash": float(algo_capital), "paper_pnl": 0.0,
+                "last_signal": 0, "last_price": 0.0, "dhan_order_id": None,
+            })
+            st.session_state[ALGO_LOG_KEY]    = []
+            st.session_state[ALGO_TRADES_KEY] = []
+            _algo_log("Session reset by user.", "warn")
+            st.rerun()
+
+        # Signal fetch and execution logic
+        if fetch_signal_btn:
+            with st.spinner("Computing live signal…"):
+                signal, bsp_val, close_price = compute_live_signal(
+                    algo_idx["security_id"], algo_tf,
+                    algo_bsp_len, algo_buy_lvl, algo_sell_lvl,
+                    algo_sig_mode, algo_ema_filter
+                )
+
+            state["last_signal"] = signal
+            state["last_price"]  = close_price
+            state["last_refresh"] = _dt.datetime.now().strftime("%H:%M:%S")
+
+            _sig_txt = {1: "BUY (CE)", -1: "SELL (PE)", 0: "NEUTRAL"}[signal]
+            _algo_log(
+                f"Signal: {_sig_txt} | BSP={bsp_val:.4f} | {algo_index} {close_price:.2f}",
+                "buy" if signal == 1 else ("sell" if signal == -1 else "info")
+            )
+
+            # Fetch option LTP
+            opt_ltp = fetch_live_option_ltp(
+                algo_idx["security_id"],
+                algo_strike_offset,
+                "CALL" if signal >= 0 else "PUT",
+                algo_expiry
+            )
+            if opt_ltp is None:
+                opt_ltp = close_price * 0.02  # rough fallback estimate
+                _algo_log(f"Option LTP unavailable — using estimate: {opt_ltp:.2f}", "warn")
+            else:
+                _algo_log(f"Option LTP: ₹{opt_ltp:.2f}", "info")
+
+            # Execute trade
+            if signal != 0:
+                if not is_live:
+                    # ── PAPER MODE ─────────────────────────────────────────────
+                    if state["cash"] <= 0:
+                        state["cash"] = float(algo_capital)
+                    paper_execute(
+                        signal, opt_ltp, algo_idx["lot_size"],
+                        algo_lots, algo_comm / 100, state
+                    )
+                else:
+                    # ── LIVE MODE ──────────────────────────────────────────────
+                    active = state["active_leg"]
+                    exchange_seg = INDEX_OPTION_EXCHANGE[algo_index]
+                    qty = algo_lots * algo_idx["lot_size"]
+
+                    if signal == 1 and active != 1:
+                        # Close PE first if open
+                        if active == -1:
+                            _algo_log("Closing PE position (live)…", "order")
+                            close_result = place_dhan_order(
+                                security_id=str(algo_idx["security_id"]),
+                                exchange_segment=exchange_seg,
+                                transaction_type="SELL",
+                                quantity=qty,
+                                product_type=algo_product_type,
+                                remarks="NYZTrade-Close-PE"
+                            )
+                            if close_result["ok"]:
+                                _algo_log(f"PE closed. Order ID: {close_result['order_id']}", "order")
+                                pnl = (opt_ltp - state["entry_price"]) * qty
+                                state["paper_pnl"] += pnl
+                            else:
+                                _algo_log(f"PE close FAILED: {close_result.get('error','?')}", "error")
+                            state["active_leg"] = 0
+
+                        # Open CE
+                        _algo_log("Placing CE BUY order (live)…", "order")
+                        buy_result = place_dhan_order(
+                            security_id=str(algo_idx["security_id"]),
+                            exchange_segment=exchange_seg,
+                            transaction_type="BUY",
+                            quantity=qty,
+                            product_type=algo_product_type,
+                            remarks="NYZTrade-Buy-CE"
+                        )
+                        if buy_result["ok"]:
+                            state.update({"active_leg": 1, "entry_price": opt_ltp,
+                                          "entry_time": _dt.datetime.now().isoformat(),
+                                          "dhan_order_id": buy_result["order_id"]})
+                            _algo_log(f"CE BUY placed ✅ Order ID: {buy_result['order_id']}", "buy")
+                            st.session_state[ALGO_TRADES_KEY].append({
+                                "time": _dt.datetime.now().strftime("%H:%M:%S"),
+                                "leg": "CE", "action": "BUY (LIVE)",
+                                "price": round(opt_ltp, 2), "lots": algo_lots,
+                                "pnl": 0.0, "order_id": buy_result["order_id"],
+                                "mode": "Live"
+                            })
+                        else:
+                            _algo_log(f"CE BUY FAILED ❌: {buy_result.get('error','?')}", "error")
+                            st.error(f"Order failed: {buy_result.get('raw', {})}")
+
+                    elif signal == -1 and active != -1:
+                        # Close CE first if open
+                        if active == 1:
+                            _algo_log("Closing CE position (live)…", "order")
+                            close_result = place_dhan_order(
+                                security_id=str(algo_idx["security_id"]),
+                                exchange_segment=exchange_seg,
+                                transaction_type="SELL",
+                                quantity=qty,
+                                product_type=algo_product_type,
+                                remarks="NYZTrade-Close-CE"
+                            )
+                            if close_result["ok"]:
+                                _algo_log(f"CE closed. Order ID: {close_result['order_id']}", "order")
+                                pnl = (opt_ltp - state["entry_price"]) * qty
+                                state["paper_pnl"] += pnl
+                            else:
+                                _algo_log(f"CE close FAILED: {close_result.get('error','?')}", "error")
+                            state["active_leg"] = 0
+
+                        # Open PE
+                        _algo_log("Placing PE BUY order (live)…", "order")
+                        buy_result = place_dhan_order(
+                            security_id=str(algo_idx["security_id"]),
+                            exchange_segment=exchange_seg,
+                            transaction_type="BUY",
+                            quantity=qty,
+                            product_type=algo_product_type,
+                            remarks="NYZTrade-Buy-PE"
+                        )
+                        if buy_result["ok"]:
+                            state.update({"active_leg": -1, "entry_price": opt_ltp,
+                                          "entry_time": _dt.datetime.now().isoformat(),
+                                          "dhan_order_id": buy_result["order_id"]})
+                            _algo_log(f"PE BUY placed ✅ Order ID: {buy_result['order_id']}", "sell")
+                            st.session_state[ALGO_TRADES_KEY].append({
+                                "time": _dt.datetime.now().strftime("%H:%M:%S"),
+                                "leg": "PE", "action": "BUY (LIVE)",
+                                "price": round(opt_ltp, 2), "lots": algo_lots,
+                                "pnl": 0.0, "order_id": buy_result["order_id"],
+                                "mode": "Live"
+                            })
+                        else:
+                            _algo_log(f"PE BUY FAILED ❌: {buy_result.get('error','?')}", "error")
+                            st.error(f"Order failed: {buy_result.get('raw', {})}")
+            else:
+                _algo_log("No trade — signal is NEUTRAL.", "info")
+
+            st.rerun()
+
+        # ── Last signal display ───────────────────────────────────────────────
+        if state["last_refresh"]:
+            _sig_val = state["last_signal"]
+            _sig_color = "#00d4aa" if _sig_val == 1 else ("#ff4b6e" if _sig_val == -1 else "#888")
+            _sig_name  = {1: "🟢 BUY → CE", -1: "🔴 SELL → PE", 0: "⚪ NEUTRAL"}[_sig_val]
+            st.markdown(
+                f"<div style='background:#1a1d29;border-radius:10px;padding:14px;"
+                f"border-left:4px solid {_sig_color};margin:10px 0'>"
+                f"<span style='font-size:1.1rem;color:{_sig_color};font-weight:700'>"
+                f"{_sig_name}</span>"
+                f"<span style='color:#888;font-size:0.8rem;float:right'>Last: {state['last_refresh']}"
+                f" &nbsp;|&nbsp; Close: ₹{state['last_price']:,.2f}</span>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+        # Auto-refresh countdown note
+        if algo_refresh != "Off (Manual)":
+            refresh_map = {
+                "30 seconds": 30, "1 minute": 60,
+                "2 minutes": 120, "5 minutes": 300
+            }
+            secs = refresh_map.get(algo_refresh, 60)
+            st.caption(
+                f"⏱️ Auto-refresh set to **{algo_refresh}**. "
+                f"Click **Fetch Live Signal** or enable Streamlit `st.rerun()` scheduling. "
+                f"For true auto-refresh, run with `--server.runOnSave=false` and use a scheduler."
+            )
+
+        st.markdown("---")
+
+        # ── Open Position Card ─────────────────────────────────────────────────
+        st.markdown("#### 📌 Open Position")
+        if state["active_leg"] != 0:
+            _pos_leg = "CE (Call)" if state["active_leg"] == 1 else "PE (Put)"
+            _pos_color = "#00d4aa" if state["active_leg"] == 1 else "#ff4b6e"
+            _entry_t   = state["entry_time"][:19].replace("T", " ") if state["entry_time"] else "—"
+            st.markdown(
+                f"<div style='background:#1a1d29;border:1px solid {_pos_color};"
+                f"border-radius:10px;padding:16px'>"
+                f"<table style='width:100%;font-size:0.9rem'>"
+                f"<tr><td style='color:#888'>Instrument</td>"
+                f"<td style='color:{_pos_color};font-weight:700'>{algo_index} {algo_strike_lbl} {_pos_leg}</td></tr>"
+                f"<tr><td style='color:#888'>Entry Price</td>"
+                f"<td style='color:#fff'>₹{state['entry_price']:,.2f}</td></tr>"
+                f"<tr><td style='color:#888'>Lots</td>"
+                f"<td style='color:#fff'>{state['n_lots']}</td></tr>"
+                f"<tr><td style='color:#888'>Entry Time</td>"
+                f"<td style='color:#fff'>{_entry_t}</td></tr>"
+                f"<tr><td style='color:#888'>Mode</td>"
+                f"<td style='color:{'#ffaa00' if is_live else '#00aaff'}'>{'💰 LIVE' if is_live else '📋 PAPER'}</td></tr>"
+                f"</table></div>",
+                unsafe_allow_html=True
+            )
+            # Manual close button
+            if st.button("⛔ Close Position Now", type="secondary", key="manual_close"):
+                with st.spinner("Fetching current price to close position…"):
+                    _close_ltp = fetch_live_option_ltp(
+                        algo_idx["security_id"], algo_strike_offset,
+                        "CALL" if state["active_leg"] == 1 else "PUT",
+                        algo_expiry
+                    )
+                if _close_ltp and _close_ltp > 0:
+                    _qty = state["n_lots"] * algo_idx["lot_size"]
+                    _pnl = (_close_ltp - state["entry_price"]) * _qty
+                    state["paper_pnl"] += _pnl
+                    state["cash"] += state["entry_price"] * _qty + _pnl
+                    _leg_name = "CE" if state["active_leg"] == 1 else "PE"
+                    _algo_log(f"MANUAL CLOSE {_leg_name} @ {_close_ltp:.2f} | P&L ₹{_pnl:+,.2f}",
+                              "buy" if state["active_leg"] == 1 else "sell")
+                    st.session_state[ALGO_TRADES_KEY].append({
+                        "time": _dt.datetime.now().strftime("%H:%M:%S"),
+                        "leg": _leg_name, "action": "MANUAL CLOSE",
+                        "price": round(_close_ltp, 2), "lots": state["n_lots"],
+                        "pnl": round(_pnl, 2), "mode": "Paper" if not is_live else "Live"
+                    })
+                    state.update({"active_leg": 0, "entry_price": 0.0,
+                                  "entry_time": None, "dhan_order_id": None})
+                    st.rerun()
+                else:
+                    st.error("Could not fetch live price to close position.")
+        else:
+            st.info("No open position.")
+
+        st.markdown("---")
+
+        # ── Session Trade Log ─────────────────────────────────────────────────
+        st.markdown("#### 📋 Session Trade Log")
+        algo_trades = st.session_state.get(ALGO_TRADES_KEY, [])
+        if algo_trades:
+            tdf_algo = pd.DataFrame(algo_trades)
+            tdf_algo["cum_pnl"] = tdf_algo["pnl"].cumsum().round(2)
+
+            def _style_algo_row(row):
+                styles = [""] * len(row)
+                if "leg" in row.index:
+                    leg_i = list(row.index).index("leg")
+                    styles[leg_i] = ("background-color:rgba(0,212,170,0.12)"
+                                     if row["leg"] == "CE"
+                                     else "background-color:rgba(255,75,110,0.12)")
+                return styles
+
+            styled_algo = (
+                tdf_algo.style
+                .apply(_style_algo_row, axis=1)
+                .applymap(
+                    lambda v: ("color:#00d4aa" if isinstance(v, (int, float)) and v > 0
+                               else "color:#ff4b6e" if isinstance(v, (int, float)) and v < 0
+                               else ""),
+                    subset=["pnl", "cum_pnl"] if "cum_pnl" in tdf_algo.columns else ["pnl"]
+                )
+                .format({"price": "{:.2f}", "pnl": "{:+.2f}", "cum_pnl": "{:+.2f}"})
+            )
+            st.dataframe(styled_algo, use_container_width=True, height=220)
+
+            _total_pnl = tdf_algo["pnl"].sum()
+            _wins      = (tdf_algo["pnl"] > 0).sum()
+            _closed    = tdf_algo[tdf_algo["action"].str.contains("CLOSE|MANUAL", na=False)]
+            cA, cB, cC = st.columns(3)
+            cA.metric("Session P&L",  f"₹{_total_pnl:+,.2f}")
+            cB.metric("Closed Trades", len(_closed))
+            cC.metric("Winning Closes",
+                      f"{_wins}" if len(_closed) == 0
+                      else f"{(_closed['pnl']>0).sum()}/{len(_closed)}")
+
+            csv_algo = tdf_algo.to_csv(index=False).encode()
+            st.download_button("⬇️ Download Trade Log", csv_algo,
+                               "algo_session_trades.csv", "text/csv",
+                               key="dl_algo_trades")
+        else:
+            st.caption("No trades this session yet.")
+
+    # ── Activity Log (full width below columns) ───────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📜 Activity Log")
+    log_entries = st.session_state.get(ALGO_LOG_KEY, [])
+    if log_entries:
+        log_text = "\n".join(reversed(log_entries[-50:]))  # newest first
+        st.code(log_text, language=None)
+        if st.button("🗑️ Clear Log", key="clear_log"):
+            st.session_state[ALGO_LOG_KEY] = []
+            st.rerun()
+    else:
+        st.caption("Activity log is empty. Click **Fetch Live Signal** to start.")
+
+    # ── How-It-Works expander ─────────────────────────────────────────────────
+    with st.expander("ℹ️ How Algo Deployment Works", expanded=False):
+        st.markdown("""
+**Signal Logic** (identical to backtester CE/PE Alternating mode):
+- **BUY signal** (BSP > buy level + EMA trend up) → Open CE / close PE if open
+- **SELL signal** (BSP < sell level + EMA trend down) → Open PE / close CE if open
+
+**Paper Trading mode:**
+- No real orders. Tracks virtual P&L using live option LTP from Dhan API.
+- Use this to validate the strategy in real market conditions before going live.
+- Session resets when you refresh the page (not persistent).
+
+**Real Trading mode:**
+- Places actual orders via `POST /orders` on your Dhan account.
+- Uses MARKET orders by default for fastest execution.
+- `securityId` used is the index's rollingoption security ID — confirm with Dhan scripmaster.
+- Always test in Paper mode first.
+
+**Auto-Refresh:**
+- Streamlit doesn't natively support background loops.
+- Set a short timeframe (1-5 min) and manually click **Fetch Live Signal** each candle close,
+  or run a cron job / external scheduler that POSTs to the app.
+
+**EOD Square-off:**
+- Checked = position will be flagged for closure when you trigger signal fetch after 3:15 PM IST.
+
+**SEBI compliance note:**
+- This tool is for personal/educational use. If offering as a service, ensure SEBI algo registration.
+        """)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN
+# BACKTESTER PAGE (wrapped inside page_tab1)
 # ══════════════════════════════════════════════════════════════════════════════
+with page_tab1:
+    st.divider()
+    pass  # backtester content rendered below
 
 if run_btn:
 
